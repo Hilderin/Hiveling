@@ -1,0 +1,15 @@
+version: 1
+
+workers:
+  - name: ghost
+    host: 127.0.0.1
+    port: 9999
+
+defaults:
+  model: opencode-go/deepseek-v4-flash
+  auto: true
+
+tasks:
+  - id: unreachable
+    prompt: "This should never run."
+    download: none

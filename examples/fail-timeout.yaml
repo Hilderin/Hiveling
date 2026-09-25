@@ -1,0 +1,19 @@
+version: 1
+
+# Timeout test: the worker should kill OpenCode after ~5s and report a failure.
+
+workers:
+  - name: local
+    host: 127.0.0.1
+    port: 8787
+
+defaults:
+  model: opencode-go/deepseek-v4.1-flash
+  auto: true
+
+tasks:
+  - id: slow
+    prompt: >
+      Run the shell command sleep 120, then reply DONE.
+    timeout_s: 5
+    download: none

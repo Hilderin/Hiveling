@@ -1,0 +1,31 @@
+version: 1
+
+# Failure handling test: the first task fails (invalid model), the second
+# depends on it and must be skipped, the third has no dependency and should
+# run when --keep-going is used.
+
+workers:
+  - name: local
+    host: 127.0.0.1
+    port: 8787
+
+defaults:
+  model: opencode-go/deepseek-v4.1-flash
+  auto: true
+  timeout_s: 300
+  poll_interval_s: 2
+
+tasks:
+  - id: broken
+    prompt: "This task must fail because the model does not exist."
+    model: totally-invalid-provider/no-such-model
+    download: none
+
+  - id: depends-on-broken
+    prompt: "This task should be skipped."
+    depends_on: [broken]
+    download: none
+
+  - id: independent-ok
+    prompt: "Reply with exactly: STILL-ALIVE"
+    download: none

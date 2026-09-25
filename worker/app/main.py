@@ -1,0 +1,211 @@
+"""FastAPI application for the worker.
+
+Protocol (v1, no authentication):
+
+- ``GET    /health``                  worker state (free/busy)
+- ``POST   /jobs``                    create a job (status ``accepted``)
+- ``PUT    /jobs/{id}/files``         upload an input zip (optional)
+- ``POST   /jobs/{id}/start``         start execution
+- ``GET    /jobs/{id}``               detailed status
+- ``GET    /jobs/{id}/files?which=``  zip of modified files (or ``all``)
+- ``GET    /jobs/{id}/logs``          stdout (events) + stderr
+- ``DELETE /jobs/{id}``               cancel a job
+- ``GET    /jobs``                    list jobs
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import threading
+import time
+import uuid
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Request, Response
+from pydantic import BaseModel, Field
+
+from .config import Config
+from .executor import execute, _terminate
+from .files import build_zip, extract_zip, list_files
+from .state import ACTIVE_STATUSES, TERMINAL_STATUSES, Job, Registry
+
+
+class JobSpec(BaseModel):
+    job_id: str | None = None
+    prompt: str
+    model: str | None = None
+    agent: str | None = None
+    auto: bool = True
+    timeout_s: float | None = None
+    variant: str | None = None
+    title: str | None = None
+    env: dict[str, str] = Field(default_factory=dict)
+    files: list[str] = Field(default_factory=list)
+
+
+def _janitor(registry: Registry, config: Config, stop: threading.Event) -> None:
+    """Expire jobs created but never started."""
+    interval = max(1.0, min(5.0, config.accept_timeout_s / 2))
+    while not stop.wait(interval):
+        now = time.time()
+        for job in registry.all():
+            if job.status == "accepted" and now - job.created_at > config.accept_timeout_s:
+                job.status = "failed"
+                job.error = "job expired: never started by the server"
+                job.finished_at = now
+                job.save()
+
+
+def create_app(config: Config) -> FastAPI:
+    registry = Registry()
+    registry.load_from_disk(config.workspace)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=_janitor, args=(registry, config, stop), daemon=True
+        )
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            # Terminate running jobs so no orphan opencode process survives.
+            for job in registry.all():
+                if job.status in ACTIVE_STATUSES:
+                    job.shutdown_requested = True
+                    if job.process is not None:
+                        _terminate(job.process)
+                    job.status = "failed"
+                    job.error = "worker shutting down"
+                    job.finished_at = time.time()
+                    job.save()
+
+    app = FastAPI(title="Hiveling worker", version="1.0.0", lifespan=lifespan)
+
+    def get_job_or_404(job_id: str) -> Job:
+        job = registry.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"unknown job: {job_id}")
+        return job
+
+    @app.get("/")
+    def root() -> dict:
+        return {"name": "Hiveling worker", "version": "1.0.0", "workspace": str(config.workspace)}
+
+    @app.get("/health")
+    def health() -> dict:
+        active = registry.active()
+        try:
+            binary = shutil.which(config.opencode_bin or "opencode")
+        except Exception:
+            binary = None
+        return {
+            "status": "ok",
+            "busy": active is not None,
+            "active_job": active.job_id if active else None,
+            "opencode_bin": binary,
+            "jobs": len(registry.all()),
+        }
+
+    @app.get("/jobs")
+    def list_jobs() -> list[dict]:
+        return [job.to_status() for job in registry.all()]
+
+    @app.post("/jobs", status_code=201)
+    def create_job(spec: JobSpec) -> dict:
+        if registry.is_busy():
+            raise HTTPException(status_code=409, detail="worker busy")
+        job_id = spec.job_id or uuid.uuid4().hex
+        if registry.get(job_id) is not None:
+            raise HTTPException(status_code=409, detail=f"job already exists: {job_id}")
+
+        job_dir = config.workspace / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        job = Job(job_id=job_id, dir=job_dir, spec=spec.model_dump())
+        job.workdir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "request.json").write_text(
+            json.dumps(spec.model_dump(), indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        registry.add(job)
+        job.save()
+        return job.to_status()
+
+    @app.put("/jobs/{job_id}/files")
+    async def upload_files(job_id: str, request: Request) -> dict:
+        job = get_job_or_404(job_id)
+        if job.status != "accepted":
+            raise HTTPException(status_code=409, detail=f"job already started ({job.status})")
+        data = await request.body()
+        if not data:
+            raise HTTPException(status_code=400, detail="empty body")
+        try:
+            extracted = extract_zip(data, job.workdir)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"invalid zip: {exc}") from exc
+        (job.dir / "inputs.json").write_text(
+            json.dumps(extracted, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        return {"job_id": job_id, "extracted": extracted}
+
+    @app.post("/jobs/{job_id}/start")
+    def start_job(job_id: str) -> dict:
+        job = get_job_or_404(job_id)
+        if job.status != "accepted":
+            raise HTTPException(status_code=409, detail=f"job cannot start ({job.status})")
+        thread = threading.Thread(target=execute, args=(job, config), daemon=True)
+        job.thread = thread
+        thread.start()
+        return job.to_status()
+
+    @app.get("/jobs/{job_id}")
+    def get_job(job_id: str) -> dict:
+        return get_job_or_404(job_id).to_status()
+
+    @app.get("/jobs/{job_id}/files")
+    def get_files(job_id: str, which: str = "modified") -> Response:
+        job = get_job_or_404(job_id)
+        if which == "all":
+            files = list_files(job.workdir)
+        elif which == "modified":
+            files = sorted(set(job.added) | set(job.modified))
+        else:
+            raise HTTPException(status_code=400, detail="which must be 'modified' or 'all'")
+        data = build_zip(job.workdir, files)
+        return Response(
+            content=data,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{job_id}.zip"'},
+        )
+
+    @app.get("/jobs/{job_id}/logs")
+    def get_logs(job_id: str) -> dict:
+        job = get_job_or_404(job_id)
+        events = ""
+        stderr = ""
+        events_path = job.dir / "events.jsonl"
+        stderr_path = job.dir / "stderr.log"
+        if events_path.exists():
+            events = events_path.read_text(encoding="utf-8", errors="replace")
+        if stderr_path.exists():
+            stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+        return {"job_id": job_id, "stdout": events, "stderr": stderr}
+
+    @app.delete("/jobs/{job_id}")
+    def cancel_job(job_id: str) -> dict:
+        job = get_job_or_404(job_id)
+        if job.status in TERMINAL_STATUSES:
+            return job.to_status()
+        job.cancel_requested = True
+        if job.process is not None:
+            _terminate(job.process)
+        if job.status == "accepted":
+            job.status = "canceled"
+            job.error = "job canceled before start"
+            job.finished_at = time.time()
+            job.save()
+        return job.to_status()
+
+    return app

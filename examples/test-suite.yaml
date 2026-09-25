@@ -1,0 +1,54 @@
+version: 1
+
+workers:
+  - name: local
+    host: 127.0.0.1
+    port: 8787
+
+defaults:
+  model: opencode-go/deepseek-v4.1-flash
+  agent: build
+  auto: true
+  timeout_s: 600
+  poll_interval_s: 2
+
+tasks:
+  - id: t1-text
+    prompt: "Reply with exactly: OK"
+    download: none
+
+  - id: t2-write-nested
+    prompt: >
+      Create the file src/greeting.py containing a function hello() that
+      returns the string "hello". Also create a README.md whose only content
+      is the line "# Demo". Do not create or modify anything else.
+    depends_on: [t1-text]
+
+  - id: t3-shell
+    prompt: >
+      Run the shell command python3 -c "print(6*7)" and reply with the
+      resulting number only.
+    download: none
+
+  - id: t4-static-input
+    prompt: >
+      Read every .txt and .csv file in the current directory and write a file
+      summary.md listing each file name and its number of lines.
+    files:
+      - inputs/*.txt
+      - inputs/*.csv
+    depends_on: [t2-write-nested]
+
+  - id: t5-edit-reuse
+    prompt: >
+      Read src/greeting.py and add a second function goodbye() that returns
+      the string "bye". Keep the existing hello() function.
+    inputs_from: [t2-write-nested]
+    download: all
+
+  - id: t6-verify
+    prompt: >
+      Read src/greeting.py and confirm that both hello() and goodbye() exist.
+      Reply with a single line: yes or no.
+    inputs_from: [t5-edit-reuse]
+    download: none

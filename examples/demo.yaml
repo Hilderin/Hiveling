@@ -1,0 +1,34 @@
+version: 1
+
+# edited via dashboard
+
+# Worker list. V1: the server dispatches to the first free worker.
+workers:
+  - name: local
+    host: 127.0.0.1
+    port: 8787
+
+defaults:
+  model: opencode-go/deepseek-v4.1-flash
+  agent: build
+  auto: true
+  timeout_s: 600
+  poll_interval_s: 2
+
+tasks:
+  - id: hello
+    prompt: "Reply with exactly: PONG"
+    download: none
+
+  - id: create-file
+    prompt: >
+      Create a file named report.txt containing three lines:
+      line 1, line 2, line 3.
+      Do not use any other tool.
+    depends_on: [hello]
+
+  - id: summarize
+    prompt: >
+      You receive the file report.txt. Summarize it in a single sentence.
+    depends_on: [create-file]
+    inputs_from: [create-file]

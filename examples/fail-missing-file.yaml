@@ -1,0 +1,17 @@
+version: 1
+
+workers:
+  - name: local
+    host: 127.0.0.1
+    port: 8787
+
+defaults:
+  model: opencode-go/deepseek-v4-flash
+  auto: true
+
+tasks:
+  - id: needs-missing
+    prompt: "This should never run."
+    files:
+      - does-not-exist.txt
+    download: none

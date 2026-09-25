@@ -1,0 +1,53 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environnements virtuels
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Tests & couverture
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+
+# Outils de typage / lint
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Variables d'environnement (secrets)
+.env
+.env.*
+
+# Logs
+*.log
+
+# Données locales du projet
+.data/
+
+# Outils / IDE
+.idea/
+.vscode/
+.openchamber/
+
+# OS
+.DS_Store
+Thumbs.db

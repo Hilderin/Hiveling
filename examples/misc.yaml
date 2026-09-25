@@ -1,0 +1,31 @@
+version: 1
+
+workers:
+  - name: local
+    host: 127.0.0.1
+    port: 8787
+
+defaults:
+  model: opencode-go/deepseek-v4.1-flash
+  auto: true
+  timeout_s: 300
+  poll_interval_s: 2
+
+tasks:
+  - id: env-var
+    prompt_file: prompts/echo-env.md
+    env:
+      MY_TEST_VAR: hello-env-42
+    download: none
+
+  - id: dir-input
+    prompt: >
+      List the files present in the inputs directory and reply with their
+      names, one per line, nothing else.
+    files:
+      - inputs
+    download: none
+
+  - id: prompt-var
+    prompt: "Reply with exactly: VAR-OK"
+    download: none

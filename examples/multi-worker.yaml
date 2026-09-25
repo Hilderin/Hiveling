@@ -1,0 +1,32 @@
+version: 1
+
+workers:
+  - name: w1
+    host: 127.0.0.1
+    port: 8787
+  - name: w2
+    host: 127.0.0.1
+    port: 8788
+
+defaults:
+  model: opencode-go/deepseek-v4.1-flash
+  auto: true
+  timeout_s: 300
+  poll_interval_s: 2
+
+tasks:
+  - id: m1
+    prompt: "Reply with exactly: M1"
+    download: none
+
+  - id: m2
+    prompt: "Reply with exactly: M2"
+    download: none
+
+  - id: m3
+    prompt: "Reply with exactly: M3"
+    download: none
+
+  - id: m4
+    prompt: "Reply with exactly: M4"
+    download: none
