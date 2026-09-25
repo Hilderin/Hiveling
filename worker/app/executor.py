@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import threading
 import time
+from functools import lru_cache
 from pathlib import Path
 
 from .config import Config
@@ -77,17 +79,43 @@ def _terminate(process: subprocess.Popen) -> None:
             pass
 
 
+@lru_cache(maxsize=None)
+def _run_flags(binary: str) -> frozenset[str]:
+    """Flags supported by ``opencode run``, probed once per binary.
+
+    OpenCode V1 exposes ``--dir`` and ``--variant``; V2 dropped both (the
+    working directory comes from the process cwd and the variant is part of
+    the model string as ``provider/model#variant``). If the probe fails we
+    assume V2, the syntax used by current releases.
+    """
+    try:
+        proc = subprocess.run(
+            [binary, "run", "--help"], capture_output=True, text=True, timeout=20
+        )
+    except Exception:
+        return frozenset()
+    return frozenset(re.findall(r"--[a-z][a-z0-9-]*", proc.stdout + proc.stderr))
+
+
 def _build_command(binary: str, job: Job, workdir: Path) -> list[str]:
     spec = job.spec
-    command = [binary, "run", "--format", "json", "--dir", str(workdir)]
+    flags = _run_flags(binary)
+    command = [binary, "run", "--format", "json"]
+    if "--dir" in flags:
+        command += ["--dir", str(workdir)]
     if spec.get("auto", True):
         command.append("--auto")
-    if spec.get("model"):
-        command += ["--model", spec["model"]]
+    model = spec.get("model")
+    variant = spec.get("variant")
+    if variant and "--variant" in flags:
+        command += ["--variant", variant]
+        variant = None
+    if model:
+        if variant and "#" not in model:
+            model = f"{model}#{variant}"
+        command += ["--model", model]
     if spec.get("agent"):
         command += ["--agent", spec["agent"]]
-    if spec.get("variant"):
-        command += ["--variant", spec["variant"]]
     if spec.get("title"):
         command += ["--title", spec["title"]]
     for extra in spec.get("files") or []:
