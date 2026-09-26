@@ -38,6 +38,7 @@ from .plan_files import (
     write_plan,
 )
 from .readers import read_json, read_text, zip_dir
+from .redact import make_redactor
 from .runs import TERMINAL_RUN_STATUSES, RunStore, new_run_id
 from .workers import WorkerRegistry, probe_workers
 
@@ -574,6 +575,10 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
         transport_security=_transport_security(config),
     )
 
+    # Every response passes through this: clients and LLMs address plans, runs,
+    # tasks and workers by name/id, never by the path they live at on disk.
+    redact = make_redactor(config)
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         manager.recover()
@@ -607,7 +612,11 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
         limit: int = 50,
         offset: int = 0,
     ) -> dict:
-        return manager.store.query(q=q, status=status, limit=max(1, min(limit, 200)), offset=offset)
+        return redact(
+            manager.store.query(
+                q=q, status=status, limit=max(1, min(limit, 200)), offset=offset
+            )
+        )
 
     @app.post("/api/runs", status_code=201)
     async def api_run_start(request: Request) -> dict:
@@ -658,7 +667,7 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
             if plan_yaml:
                 plan_path.unlink(missing_ok=True)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"run_id": run_id, "plan_path": str(plan_path)}
+        return {"run_id": run_id}
 
     @app.get("/api/runs/{run_id}")
     def api_run_get(run_id: str) -> dict:
@@ -666,7 +675,7 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
         if run is None:
             raise HTTPException(status_code=404, detail="run not found")
         run["active"] = manager.is_active(run_id)
-        return run
+        return redact(run)
 
     @app.post("/api/runs/{run_id}/cancel")
     def api_run_cancel(run_id: str) -> dict:
@@ -690,7 +699,7 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
             raise HTTPException(status_code=404, detail="run not found")
         if result.get("reason", "").startswith("until must be"):
             raise HTTPException(status_code=400, detail=result["reason"])
-        return result
+        return redact(result)
 
     @app.post("/api/runs/{run_id}/tasks/{task_id}/cancel")
     def api_task_cancel(run_id: str, task_id: str) -> dict:
@@ -717,23 +726,20 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
         base_dir = Path(run["base_dir"]) if run.get("base_dir") else None
         return {
             "name": path.name,
-            "path": str(path),
-            "source_path": run.get("plan_path"),
-            "snapshot": run.get("plan_snapshot"),
             "content": path.read_text(encoding="utf-8"),
-            "summary": plan_summary(path, base_dir=base_dir),
+            "summary": redact(plan_summary(path, base_dir=base_dir)),
         }
 
     @app.put("/api/runs/{run_id}/plan")
     def api_run_plan_put(run_id: str, body: SavePlanRequest) -> dict:
         """Edit a run's plan (live: applied between tasks; also writes the source)."""
         try:
-            path = manager.update_run_plan(run_id, body.content)
+            manager.update_run_plan(run_id, body.content)
         except PlanError as exc:
             detail = str(exc)
             status = 404 if detail.startswith("run not found") else 400
             raise HTTPException(status_code=status, detail=detail) from exc
-        return {"ok": True, "path": str(path)}
+        return {"ok": True}
 
     # ------------------------------------------------------------------ tasks
     def task_history_dir(run: dict, task_id: str) -> Path | None:
@@ -775,7 +781,7 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
                     detail["request"]["prompt"] = plan.task_by_id(task_id).prompt
                 except PlanError:
                     pass
-        return detail
+        return redact(detail)
 
     @app.get("/api/runs/{run_id}/tasks/{task_id}/files")
     def api_task_files(run_id: str, task_id: str) -> Response:
@@ -822,9 +828,7 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
     @app.get("/api/workers")
     def api_workers() -> dict:
         data = probe_workers(manager.workers, WORKER_PROBE_TIMEOUT)
-        data["data_dir"] = str(config.data_dir)
-        data["workers_file"] = str(config.workers_path)
-        return data
+        return redact(data)
 
     # -------------------------------------------------------------- dashboard
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

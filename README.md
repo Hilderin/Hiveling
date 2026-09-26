@@ -32,6 +32,10 @@ V1 characteristics:
   skills). See [Resources (environment)](#resources-environment).
 - No authentication on the JSON API/dashboard; the MCP endpoint supports an
   optional bearer token.
+- The JSON API and MCP responses never expose filesystem paths: plans, runs,
+  tasks and workers are addressed by name/id, and the server's `data-dir`, the
+  workers' `path_roots` and the worker URLs are not returned (see
+  `server/app/redact.py`).
 - An MCP (Streamable HTTP) endpoint lets a local OpenCode start and monitor
   runs with typed tools (see [MCP server](#mcp-server)).
 - Runs are durable: each run snapshots its plan and records per-task state on

@@ -33,6 +33,7 @@ from .plan_files import (
 )
 from .plan_schema import PLAN_EXAMPLE, PLAN_REFERENCE, PlanInput, plan_to_yaml
 from .readers import read_json, read_text
+from .redact import make_redactor
 from .workers import probe_workers
 
 EVENTS_TAIL_LINES = 200
@@ -77,6 +78,10 @@ def create_mcp_server(manager, config) -> MCPServer:
         instructions=INSTRUCTIONS,
     )
 
+    # Clients and LLMs address plans, runs, tasks and workers by name/id. The
+    # path where the server/workers keep them on disk is never returned.
+    redact = make_redactor(config)
+
     # ------------------------------------------------------------------ helpers
     def history_dir_for(run: dict, task_id: str) -> Path | None:
         for task in run.get("tasks", []):
@@ -112,19 +117,18 @@ def create_mcp_server(manager, config) -> MCPServer:
             plans.append(
                 {
                     "name": plan_name(config.plans_dir, path),
-                    "path": str(path),
                     "editable": is_editable_plan(config.plans_dir, config.data_dir, path),
                     "task_count": len(summary["tasks"]),
-                    "error": summary["error"],
+                    "error": redact.text(summary["error"] or ""),
                 }
             )
-        return {"plans": plans, "plans_dir": str(config.plans_dir)}
+        return {"plans": plans}
 
     @mcp.tool()
     def get_plan(name: str) -> dict[str, Any]:
         """Return the YAML content and a summary of a stored plan.
 
-        ``name`` is the path returned by list_plans (relative to the plans dir).
+        ``name`` is a plan name from list_plans (relative to the plans dir).
         """
         try:
             path = resolve_known_plan(config.plans_dir, name)
@@ -134,9 +138,8 @@ def create_mcp_server(manager, config) -> MCPServer:
             raise ToolError(f"plan not found: {name}")
         return {
             "name": plan_name(config.plans_dir, path),
-            "path": str(path),
             "content": path.read_text(encoding="utf-8"),
-            "summary": plan_summary(path),
+            "summary": redact(plan_summary(path)),
         }
 
     @mcp.tool()
@@ -158,7 +161,7 @@ def create_mcp_server(manager, config) -> MCPServer:
             write_plan(path, content)
         except PlanError as exc:
             raise ToolError(str(exc)) from exc
-        return {"ok": True, "name": plan_name(config.plans_dir, path), "path": str(path)}
+        return {"ok": True, "name": plan_name(config.plans_dir, path)}
 
     @mcp.tool()
     def get_plan_schema() -> dict[str, Any]:
@@ -206,9 +209,8 @@ def create_mcp_server(manager, config) -> MCPServer:
         return {
             "ok": True,
             "name": plan_name(config.plans_dir, path),
-            "path": str(path),
             "content": content,
-            "summary": plan_summary(path),
+            "summary": redact(plan_summary(path)),
         }
 
     @mcp.tool()
@@ -228,10 +230,8 @@ def create_mcp_server(manager, config) -> MCPServer:
         return {
             "run_id": run_id,
             "name": path.name,
-            "path": str(path),
-            "source_path": run.get("plan_path"),
             "content": path.read_text(encoding="utf-8"),
-            "summary": plan_summary(path, base_dir=base_dir),
+            "summary": redact(plan_summary(path, base_dir=base_dir)),
         }
 
     @mcp.tool()
@@ -246,10 +246,10 @@ def create_mcp_server(manager, config) -> MCPServer:
         not tied to a run.
         """
         try:
-            path = manager.update_run_plan(run_id, content)
+            manager.update_run_plan(run_id, content)
         except PlanError as exc:
             raise ToolError(str(exc)) from exc
-        return {"ok": True, "run_id": run_id, "path": str(path)}
+        return {"ok": True, "run_id": run_id}
 
     # --------------------------------------------------------------------- runs
     @mcp.tool()
@@ -285,7 +285,7 @@ def create_mcp_server(manager, config) -> MCPServer:
             raise ToolError("provide 'plan' (a name from list_plans) or 'plan_yaml'")
 
         run_id = start_run(plan_path, only=only)
-        return {"run_id": run_id, "plan_path": str(plan_path), "status": "started"}
+        return {"run_id": run_id, "status": "started"}
 
     @mcp.tool()
     def list_runs(
@@ -299,8 +299,10 @@ def create_mcp_server(manager, config) -> MCPServer:
         ``q`` searches the plan name and run id; ``status`` filters on run
         status (``all``, ``running``, ``succeeded``, ``failed``, ``canceled``).
         """
-        return manager.store.query(
-            q=q, status=status, limit=max(1, min(limit, 200)), offset=max(0, offset)
+        return redact(
+            manager.store.query(
+                q=q, status=status, limit=max(1, min(limit, 200)), offset=max(0, offset)
+            )
         )
 
     @mcp.tool()
@@ -313,7 +315,7 @@ def create_mcp_server(manager, config) -> MCPServer:
         if run is None:
             raise ToolError(f"run not found: {run_id}")
         run["active"] = manager.is_active(run_id)
-        return run
+        return redact(run)
 
     @mcp.tool()
     def get_task(run_id: str, task_id: str, events_tail_lines: int = 50) -> dict[str, Any]:
@@ -361,7 +363,7 @@ def create_mcp_server(manager, config) -> MCPServer:
             detail["event_lines"] = total
             stderr, _ = read_text(directory / "stderr.log", tail)
             detail["stderr"] = stderr
-        return detail
+        return redact(detail)
 
     @mcp.tool()
     def cancel_run(run_id: str) -> dict[str, Any]:
@@ -406,7 +408,7 @@ def create_mcp_server(manager, config) -> MCPServer:
             raise ToolError(f"run not found: {run_id}")
         if str(result.get("reason", "")).startswith("until must be"):
             raise ToolError(result["reason"])
-        return result
+        return redact(result)
 
     @mcp.tool()
     def resume_run(run_id: str) -> dict[str, Any]:
@@ -420,7 +422,7 @@ def create_mcp_server(manager, config) -> MCPServer:
         result = manager.resume_run(run_id)
         if not result.get("ok"):
             raise ToolError(f"cannot resume run {run_id}: {result.get('reason')}")
-        return result
+        return redact(result)
 
     # ------------------------------------------------------------------ workers
     @mcp.tool()
@@ -432,9 +434,7 @@ def create_mcp_server(manager, config) -> MCPServer:
         server restart.
         """
         data = probe_workers(manager.workers)
-        data["data_dir"] = str(config.data_dir)
-        data["workers_file"] = str(config.workers_path)
-        return data
+        return redact(data)
 
     # --------------------------------------------------------------- resources
     @mcp.resource(
