@@ -1,131 +1,142 @@
 ---
-name: Hiveling plan authoring
-description: Author or edit a Hiveling plan.yaml (tasks, requirements, resources, opencode, artifacts) via the Hiveling MCP tools. Use when creating, reviewing or debugging a Hiveling run/plan.
+name: Hiveling plans and runs
+description: Create, run and supervise Hiveling plans through the Hiveling MCP tools (plan.yaml, workers/requirements, resources, opencode config, artifacts, the fail-fast/resume agentic loop). Use when a task must be executed on remote OpenCode workers, when authoring or fixing a plan.yaml, or when driving a Hiveling run to completion.
 ---
 
-# Authoring a Hiveling plan
+# Driving Hiveling through MCP
 
-Hiveling runs a `plan.yaml`'s task DAG on remote OpenCode workers. Before
-writing a plan, call `get_plan_schema()` (or `create_plan`, whose typed input
-schema is published in `tools/list`) and `list_workers()` to see what the
-workers can do. Prefer `create_plan` for new plans and `update_plan` /
+Hiveling executes a `plan.yaml` DAG of tasks on remote OpenCode workers and
+returns each task's result, changed files, commits and artifacts. This skill is
+the **workflow**; the **schema is the source of truth**:
+
+- call `get_plan_schema()` before authoring (full reference + canonical example),
+- call `list_workers()` before writing `requirements` or worker-local paths.
+
+Prefer `create_plan` (typed object) for new plans; `update_plan` /
 `update_run_plan` for edits.
 
-## Rules that matter
+## Golden rules
 
-- **Workers are not in the plan.** They come from `workers.yaml`; use
-  `list_workers` and target them with `requirements`. Never invent a worker.
-- **The plan is explicit and self-contained.** There is no include, no named
-  environment and no cross-task substitution. Write everything out.
-- **Every file/path is either plan-relative or a worker-local path under the
-  worker's `path_roots`.** Never use a path you did not see in `list_workers`
-  capabilities or that the user gave you.
-- **Secrets are names, never values.** `{type: secret, with: {name: MY_TOKEN}}`
-  resolves on the worker. Never put a token in the plan.
-- **`depends_on` is explicit.** Ordering is never inferred. `inputs_from` is the
-  zip/files channel only.
+- **Workers are not in the plan.** They live in `workers.yaml`; select one with
+  `requirements`. Never invent a worker, path or capability.
+- **The plan is explicit and self-contained.** No include, no named environment,
+  **no cross-task substitution**. Everything is written out.
+- **`depends_on` is always explicit.** Ordering is never inferred. `inputs_from`
+  is the **file/zip** channel only; git flows through `resources`.
+- **Secret values never appear in a plan** — only `{type: secret, with: {name}}`
+  (resolved on the worker).
+- **Paths are plan-relative or under a worker's `path_roots`.** Anything else
+  fails at prepare.
 
-## Task shape
+## Authoring (tools: get_plan_schema, list_workers, create_plan, get_plan)
+
+Minimal shape:
 
 ```yaml
 version: 1
-defaults:              # optional, applied to every task unless overridden
+defaults:                 # optional; applied to every task unless overridden
   model: provider/model
   agent: build
   timeout_s: 600
-  requirements: {os: windows, tags: [mssql]}
+  requirements: {os: linux}
   resources: [...]
   opencode: {...}
   artifacts: {download: modified}
 tasks:
   - id: unique-id
-    prompt: "..."          # or prompt_file: path/relative/to/plan
-    depends_on: [other]    # explicit ordering; skipped if a dep fails
+    prompt: "..."          # or prompt_file: relative/to/plan
+    depends_on: [other]
+    requirements: {}       # merged over defaults
+    resources: []          # merged over defaults by id
 ```
 
-A run is **fail fast**: the first failed task stops new dispatches (in-flight
-tasks finish), and `resume_run` re-arms the failed/skipped tasks.
+`requirements` is matched as a subset of a worker's advertised capabilities
+(`os`, `tags`, `providers`, `labels`); a task with no requirements runs on any
+free worker, and a task no reachable worker can satisfy **fails fast**.
 
-## Requirements (which worker)
+Resources are prepared on the worker **before** OpenCode runs. Built-ins:
+`ephemeral` (fresh dir, default), `env`, `secret`, `path`, `git`, `command`
+(opt-in). See `get_plan_schema` for every `with` option — don't guess them.
 
-Matched as a subset against `list_workers` capabilities:
+`opencode` injects an OpenCode config per job; prefer worker-local **paths**
+(`from`, `agents_paths`, `skills_paths`, `agents_md`) over inline Markdown.
 
-```yaml
-requirements:
-  os: windows            # windows | linux | macos
-  tags: [mssql]          # all must be advertised
-  providers: [git]       # all must be advertised
-  labels: {site: office} # exact per key
+## Running and supervising (the agentic loop)
+
+```
+run_plan(plan="name" | plan_yaml="..." | name+plan_yaml?) -> run_id
+loop:
+    ev = wait_for_run(run_id, until="terminal", timeout_s=600)
+    if ev.timed_out: keep waiting / inspect get_run(run_id)
+    if run.status == "succeeded": done
+    # a failure: inspect the worst task, then decide
+    bad = the failed/canceled task in get_run(run_id).tasks
+    get_task(run_id, bad.id)            # status, result, error, events, commits, merge
+    decide:
+        fix the plan  -> update_run_plan(run_id, new_yaml) then resume_run(run_id)
+        transient     -> resume_run(run_id)
+        give up       -> cancel_run(run_id)
 ```
 
-If no reachable worker matches, the task fails fast. Use `list_workers` before
-writing requirements.
+Decision rules:
 
-## Resources (what the worker prepares before OpenCode starts)
+- **Fail fast**: the first failed task stops new dispatches, but tasks already
+  running finish; the rest are `skipped` (`skip_reason`) or `canceled`. So after
+  a failure, `get_run` shows exactly what ran and what did not.
+- **`resume_run`** re-arms a finished run: failed + skipped tasks are reset to
+  `pending` (previous error kept in `last_error`) and it re-reads the plan
+  snapshot. Use it after `update_run_plan`.
+- **Live edits** (`update_run_plan`) apply **between tasks**; a running task is
+  never interrupted. New tasks are scheduled; removed pending tasks are canceled.
+- **`cancel_task`** stops one task and the run continues; **`cancel_run`** stops
+  everything.
+- Diagnose before adjusting: `get_task` gives the result text, the error, the
+  tail of OpenCode events and (when present) `commits` / `merge` / `artifacts`.
+  `events_tail_lines=0` to skip the log.
 
-Merged by `id` across `defaults.resources` and the task. Providers:
+## Recipes for an agentic dev loop
 
-- `git` — `{repo, path, worktree?, ref?, branch?, branch_mode?, push_to?, clean?,
-  cache?, publish?, remote?, force?}`. `ref` = start point, `branch` = target
-  the task commits to, `publish: none|commit|push`. Paths must be under the
-  worker `path_roots`; relative paths resolve under the job workspace.
-- `env` — `{vars: {NAME: value}}` (`${OTHER}` expands the worker env).
-- `secret` — `{name, as?, required?}` (resolved on the worker).
-- `path` — `{path, mode: ro|rw, visible?}` to expose an existing folder.
-- `command` — `{prepare, finalize, shell?, env?, cwd?, timeout_s?}`; only on
-  workers that advertise the `command` provider (opt-in).
-- `ephemeral` — a fresh workdir (the default when no resource is declared).
+- **One concern per task.** Small, bounded prompts; let the DAG express the plan.
+- **Branch per task, deterministic:** `branch: "hiveling/{run}/{task}"` +
+  `publish: push`. `{run}` and `{task}` are the only substitutions (task-local).
+- **Consume a producer's branch** by naming it + explicit ordering (no magic):
 
-**Consuming another task's branch** (no cross-task magic):
+  ```yaml
+  - id: test
+    depends_on: [build]
+    resources:
+      - {type: git, id: app, with: {repo: REPO,
+          ref: "hiveling/{run}/build", branch: "hiveling/{run}/test", publish: push}}
+  ```
 
-```yaml
-- id: build
-  resources:
-    - {type: git, id: app, with: {repo: REPO, ref: main,
-        branch: "hiveling/{run}/build", publish: push}}
-- id: test
-  depends_on: [build]
-  resources:
-    - {type: git, id: app, with: {repo: REPO,
-        ref: "hiveling/{run}/build", branch: "hiveling/{run}/test", publish: push}}
-```
+- **Integrate several branches** with `merge: [refs]` on a git resource: it
+  merges into `branch` during prepare and **resolves conflicts itself** (a
+  nested OpenCode run), committing a merge per ref. Put the tests in that task's
+  prompt, since the merge is already done before it runs. Conflicts and merge
+  commits are visible in the task events and `get_task`.
+- **Keep reports**: `artifacts: {paths: ["reports/**"]}` adds globs to the
+  downloaded zip; `artifacts: {git: true}` surfaces commits/branches.
+- **Pick the environment** with `requirements` (e.g. `os: windows`, `tags:
+  [mssql]`); a follow-up can run on a different OS as long as it consumes a
+  pushed branch.
 
-`{run}` and `{task}` are the only substitutions (server-resolved, task-local).
+## Pitfalls
 
-## OpenCode config (agents, skills, instructions)
+- Assuming tasks share a working directory: they don't. Use `inputs_from`
+  (files) or a `git` resource (code) to pass work along.
+- Using a path not under the worker's `path_roots` (see `list_workers`).
+- `command` (arbitrary shell) is refused unless the worker advertises it.
+- Long prompts are command-line arguments on the worker (Windows has limits):
+  keep prompts concise; use `prompt_file` to send a file.
+- Forgetting `depends_on` on a consumer of a produced branch.
+- Calling `update_run_plan` with invalid YAML: it is validated and rejected.
 
-Prefer **worker-local paths** over re-writing Markdown bodies:
+## Checklist
 
-```yaml
-opencode:
-  from: [/opt/team/opencode]          # opencode.json + agents/ + skills/ + AGENTS.md
-  agents_paths: [/opt/team/agents]    # agent *.md dirs
-  skills_paths: [~/shared/skills]     # skill dirs (referenced in config)
-  agents_md: [/opt/team/AGENTS.md]    # concatenated into <workdir>/AGENTS.md
-  config: {...}                       # inline opencode.json fragment (deep-merged)
-  agents: {reviewer: "You are ..."}   # inline agents
-  skills: [{name: run-tests, content: "..."}]
-```
-
-A repo checked out by a `git`/`path` resource contributes its own
-`opencode.json`, `.opencode/` and `AGENTS.md` automatically; the plan layers on
-top of it.
-
-## Artifacts
-
-```yaml
-artifacts:
-  download: modified      # modified | all | none
-  paths: ["reports/**"]   # extra globs added to the zip
-  git: true               # keep the commits/branches a git resource published
-```
-
-## Checklist before running
-
-1. `list_workers()` — requirements target real capabilities, paths are under
-   their `path_roots`.
-2. Every task has a `prompt`/`prompt_file` and a unique `id`.
-3. External branches are consumed with an explicit `depends_on`.
-4. No secret value in the plan; no invented path.
-5. Then `run_plan`, `wait_for_run(until="terminal")`, and on failure use
-   `get_task` then `update_run_plan` + `resume_run`.
+1. `get_plan_schema()` and `list_workers()` called.
+2. Every task has a unique `id` and a `prompt`/`prompt_file`.
+3. Requirements match advertised capabilities; paths under `path_roots`.
+4. Consumers list their producers in `depends_on`.
+5. No secret value in the plan; no invented path or worker.
+6. Run, then `wait_for_run(until="terminal")`; on failure `get_task` →
+   `update_run_plan` → `resume_run`; `cancel_run` to abort.
