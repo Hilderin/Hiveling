@@ -158,7 +158,19 @@ class GitProvider:
 
     def _ensure_clone(self, repo: Path, url: str) -> None:
         if (repo / ".git").exists():
-            _git(["fetch", "--all", "--prune", "--tags"], repo, check=False)
+            # A reused clone must be refreshed: a task that consumes another
+            # task's just-pushed branch needs that ref locally, and a silent
+            # fetch failure would surface later as a cryptic `worktree add`
+            # error. Fetch explicitly and fail loudly if it did not work.
+            fetch = _git(
+                ["fetch", "--all", "--prune", "--tags", "--force"],
+                repo,
+                check=False,
+            )
+            if fetch.returncode != 0:
+                raise EnvironmentError(
+                    f"git: fetch failed in '{repo}': {fetch.stderr.strip()[-500:]}"
+                )
             return
         if repo.exists() and any(repo.iterdir()):
             raise EnvironmentError(
@@ -262,11 +274,32 @@ class GitProvider:
         )
 
     @staticmethod
-    def _resolve_ref(repo: Path, ref: str) -> str:
-        for candidate in (ref, f"origin/{ref}"):
-            if _run(["rev-parse", "--verify", "--quiet", candidate], repo).returncode == 0:
-                return candidate
-        raise EnvironmentError(f"git: merge ref not found: {ref}")
+    def _resolve_ref(repo: Path, ref: str, *, label: str = "ref") -> str:
+        """Resolve a start point to a local ref/sha.
+
+        A plan names a branch as it exists on the remote (e.g.
+        ``hiveling/<run>/<task>``), but in a freshly fetched clone that name
+        only exists as ``origin/<ref>``: pass the real ref to `git worktree add`
+        / `git checkout`, otherwise git cannot find it. If the ref is not
+        available yet (blog or fork, or a racing fetch), fetch once and retry
+        before failing.
+        """
+        def lookup() -> str | None:
+            for candidate in (ref, f"origin/{ref}"):
+                if (
+                    _run(["rev-parse", "--verify", "--quiet", candidate], repo).returncode
+                    == 0
+                ):
+                    return candidate
+            return None
+
+        found = lookup()
+        if found is None:
+            _git(["fetch", "--all", "--prune", "--tags", "--force"], repo, check=False)
+            found = lookup()
+        if found is None:
+            raise EnvironmentError(f"git: {label} not found: '{ref}'")
+        return found
 
     def _resolve_conflicts(self, repo: Path, ctx: Context) -> None:
         if not ctx.opencode_bin:
@@ -294,7 +327,7 @@ class GitProvider:
         conflicts: list[str] = []
         commits: list[dict] = []
         for ref in refs:
-            target = self._resolve_ref(repo, ref)
+            target = self._resolve_ref(repo, ref, label="merge ref")
             result = _git(["merge", "--no-commit", "--no-ff", target], repo, check=False)
             unmerged, markers = self._conflicts(repo)
             if unmerged or markers:
@@ -362,7 +395,7 @@ class GitProvider:
         cache: list[str],
     ) -> None:
         # Prefer the remote-tracking ref for fetch results.
-        start = ref
+        start = self._resolve_ref(repo, ref, label="ref")
         self._clean(repo, clean, cache)
         exists = _run(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], repo)
         if branch_mode == "recreate" and exists.returncode == 0:
@@ -400,7 +433,12 @@ class GitProvider:
         if exists.returncode == 0:
             result = _git(["worktree", "add", str(workdir), branch], clone)
         else:
-            result = _git(["worktree", "add", "-b", branch, str(workdir), ref], clone)
+            # The plan names the branch as it exists on the remote; resolve it
+            # (local ref or origin/<ref>) before handing it to `worktree add`.
+            start = self._resolve_ref(clone, ref, label="ref")
+            result = _git(
+                ["worktree", "add", "-b", branch, str(workdir), start], clone
+            )
         if result.returncode != 0:
             raise EnvironmentError(
                 f"git: could not create worktree for '{branch}': "
