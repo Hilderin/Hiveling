@@ -17,6 +17,8 @@ class Config:
     accept_timeout_s: float
     default_timeout_s: float
     log_level: str
+    log_dir: Path
+    heartbeat_s: float
 
     @classmethod
     def from_args(cls, argv: list[str] | None = None) -> "Config":
@@ -60,7 +62,18 @@ class Config:
         parser.add_argument(
             "--log-level",
             default=os.environ.get("WORKER_LOG_LEVEL", "info"),
-            help="uvicorn log level (default: info)",
+            help="log level (default: info)",
+        )
+        parser.add_argument(
+            "--log-dir",
+            default=os.environ.get("WORKER_LOG_DIR", ".data/logs"),
+            help="directory for the rotating worker log (default: ./.data/logs)",
+        )
+        parser.add_argument(
+            "--heartbeat",
+            type=float,
+            default=float(os.environ.get("WORKER_HEARTBEAT", "60")),
+            help="seconds between heartbeat log lines; 0 disables (default: 60)",
         )
         args = parser.parse_args(argv)
 
@@ -72,4 +85,6 @@ class Config:
             accept_timeout_s=args.accept_timeout,
             default_timeout_s=args.default_timeout,
             log_level=args.log_level,
+            log_dir=Path(args.log_dir).expanduser().resolve(),
+            heartbeat_s=args.heartbeat,
         )

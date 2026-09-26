@@ -7,6 +7,7 @@ JSON events, then computes added/modified/deleted files.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -20,6 +21,9 @@ from pathlib import Path
 from .config import Config
 from .snapshot import diff, snapshot
 from .state import Job
+
+logger = logging.getLogger("hiveling.worker.executor")
+_PROMPT_PREVIEW = 300
 
 
 def resolve_binary(configured: str | None) -> str:
@@ -92,9 +96,22 @@ def _run_flags(binary: str) -> frozenset[str]:
         proc = subprocess.run(
             [binary, "run", "--help"], capture_output=True, text=True, timeout=20
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "could not probe flags of %s (%r); assuming OpenCode v2", binary, exc
+        )
         return frozenset()
     return frozenset(re.findall(r"--[a-z][a-z0-9-]*", proc.stdout + proc.stderr))
+
+
+def _describe_command(command: list[str]) -> str:
+    """Render a command for logs, truncating the (potentially huge) prompt."""
+    if not command:
+        return ""
+    *head, prompt = command
+    if len(prompt) > _PROMPT_PREVIEW:
+        prompt = f"{prompt[:_PROMPT_PREVIEW]}…(+{len(prompt) - _PROMPT_PREVIEW} chars)"
+    return " ".join([*head, repr(prompt)])
 
 
 def _build_command(binary: str, job: Job, workdir: Path) -> list[str]:
@@ -218,6 +235,12 @@ def execute(job: Job, config: Config) -> None:
     job.status = "running"
     job.started_at = time.time()
     job.save()
+    logger.info(
+        "job %s: executing (timeout=%.0fs, workdir=%s)",
+        job.job_id,
+        timeout_s,
+        workdir,
+    )
 
     error: str | None = None
     return_code: int | None = None
@@ -226,6 +249,13 @@ def execute(job: Job, config: Config) -> None:
     try:
         binary = resolve_binary(config.opencode_bin)
         command = _build_command(binary, job, workdir)
+        logger.info(
+            "job %s: opencode binary %s, flags %s",
+            job.job_id,
+            binary,
+            sorted(_run_flags(binary)),
+        )
+        logger.info("job %s: command: %s", job.job_id, _describe_command(command))
         env = os.environ.copy()
         for key, value in (job.spec.get("env") or {}).items():
             env[str(key)] = str(value)
@@ -246,6 +276,7 @@ def execute(job: Job, config: Config) -> None:
                 **_new_session_kwargs(),
             )
             job.process = process
+            logger.info("job %s: opencode started (pid=%s)", job.job_id, process.pid)
 
             stdout_thread = threading.Thread(
                 target=_pump, args=(process.stdout, events_file, accumulator), daemon=True
@@ -261,6 +292,12 @@ def execute(job: Job, config: Config) -> None:
             except subprocess.TimeoutExpired:
                 timed_out = True
                 error = f"timeout after {timeout_s:.0f}s"
+                logger.warning(
+                    "job %s: timed out after %.0fs, terminating opencode (pid=%s)",
+                    job.job_id,
+                    timeout_s,
+                    process.pid,
+                )
                 _terminate(process)
                 return_code = process.poll()
 
@@ -269,8 +306,10 @@ def execute(job: Job, config: Config) -> None:
 
     except FileNotFoundError as exc:
         error = str(exc)
+        logger.error("job %s: %s", job.job_id, exc)
     except Exception as exc:  # pragma: no cover - safety net
         error = f"unexpected error: {exc!r}"
+        logger.exception("job %s: unexpected error during execution", job.job_id)
 
     job.process = None
 
@@ -315,3 +354,12 @@ def execute(job: Job, config: Config) -> None:
 
     job.finished_at = time.time()
     job.save()
+    logger.info(
+        "job %s: finished status=%s exit_code=%s duration=%.3fs",
+        job.job_id,
+        job.status,
+        job.exit_code,
+        job.finished_at - (job.started_at or job.finished_at),
+    )
+    if job.status == "failed" and job.error:
+        logger.warning("job %s: %s", job.job_id, job.error)

@@ -16,6 +16,7 @@ Protocol (v1, no authentication):
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import threading
 import time
@@ -29,6 +30,8 @@ from .config import Config
 from .executor import execute, _terminate
 from .files import build_zip, extract_zip, list_files
 from .state import ACTIVE_STATUSES, TERMINAL_STATUSES, Job, Registry
+
+logger = logging.getLogger("hiveling.worker")
 
 
 class JobSpec(BaseModel):
@@ -45,8 +48,11 @@ class JobSpec(BaseModel):
 
 
 def _janitor(registry: Registry, config: Config, stop: threading.Event) -> None:
-    """Expire jobs created but never started."""
+    """Expire jobs created but never started, and emit a periodic heartbeat."""
     interval = max(1.0, min(5.0, config.accept_timeout_s / 2))
+    if config.heartbeat_s > 0:
+        interval = min(interval, max(0.5, config.heartbeat_s))
+    last_heartbeat = time.time()
     while not stop.wait(interval):
         now = time.time()
         for job in registry.all():
@@ -55,6 +61,19 @@ def _janitor(registry: Registry, config: Config, stop: threading.Event) -> None:
                 job.error = "job expired: never started by the server"
                 job.finished_at = now
                 job.save()
+                logger.warning(
+                    "job %s expired: never started within %.0fs",
+                    job.job_id,
+                    config.accept_timeout_s,
+                )
+        if config.heartbeat_s > 0 and now - last_heartbeat >= config.heartbeat_s:
+            last_heartbeat = now
+            active = registry.active()
+            logger.info(
+                "heartbeat: jobs=%d busy=%s",
+                len(registry.all()),
+                active.job_id if active else "-",
+            )
 
 
 def create_app(config: Config) -> FastAPI:
@@ -65,23 +84,44 @@ def create_app(config: Config) -> FastAPI:
     async def lifespan(_: FastAPI):
         stop = threading.Event()
         thread = threading.Thread(
-            target=_janitor, args=(registry, config, stop), daemon=True
+            target=_janitor,
+            args=(registry, config, stop),
+            daemon=True,
+            name="janitor",
         )
         thread.start()
+        logger.info(
+            "application startup: %d job(s) restored from %s",
+            len(registry.all()),
+            config.workspace,
+        )
         try:
             yield
         finally:
             stop.set()
+            active = [job for job in registry.all() if job.status in ACTIVE_STATUSES]
+            if active:
+                logger.warning(
+                    "shutting down: aborting %d active job(s): %s",
+                    len(active),
+                    ", ".join(job.job_id for job in active),
+                )
             # Terminate running jobs so no orphan opencode process survives.
             for job in registry.all():
                 if job.status in ACTIVE_STATUSES:
                     job.shutdown_requested = True
                     if job.process is not None:
+                        logger.warning(
+                            "job %s: terminating opencode (pid=%s)",
+                            job.job_id,
+                            job.process.pid,
+                        )
                         _terminate(job.process)
                     job.status = "failed"
                     job.error = "worker shutting down"
                     job.finished_at = time.time()
                     job.save()
+            logger.info("shutdown complete")
 
     app = FastAPI(title="Hiveling worker", version="1.0.0", lifespan=lifespan)
 
@@ -102,6 +142,12 @@ def create_app(config: Config) -> FastAPI:
             binary = shutil.which(config.opencode_bin or "opencode")
         except Exception:
             binary = None
+        logger.debug(
+            "health check: busy=%s jobs=%d opencode_bin=%s",
+            active.job_id if active else "-",
+            len(registry.all()),
+            binary,
+        )
         return {
             "status": "ok",
             "busy": active is not None,
@@ -131,6 +177,14 @@ def create_app(config: Config) -> FastAPI:
         )
         registry.add(job)
         job.save()
+        logger.info(
+            "job %s accepted (model=%s agent=%s auto=%s files=%d)",
+            job_id,
+            spec.model,
+            spec.agent,
+            spec.auto,
+            len(spec.files),
+        )
         return job.to_status()
 
     @app.put("/jobs/{job_id}/files")
@@ -148,6 +202,12 @@ def create_app(config: Config) -> FastAPI:
         (job.dir / "inputs.json").write_text(
             json.dumps(extracted, indent=2, ensure_ascii=False), encoding="utf-8"
         )
+        logger.info(
+            "job %s: input files uploaded (%d bytes, %d file(s))",
+            job_id,
+            len(data),
+            len(extracted),
+        )
         return {"job_id": job_id, "extracted": extracted}
 
     @app.post("/jobs/{job_id}/start")
@@ -155,9 +215,12 @@ def create_app(config: Config) -> FastAPI:
         job = get_job_or_404(job_id)
         if job.status != "accepted":
             raise HTTPException(status_code=409, detail=f"job cannot start ({job.status})")
-        thread = threading.Thread(target=execute, args=(job, config), daemon=True)
+        thread = threading.Thread(
+            target=execute, args=(job, config), daemon=True, name=f"job-{job_id}"
+        )
         job.thread = thread
         thread.start()
+        logger.info("job %s: start requested", job_id)
         return job.to_status()
 
     @app.get("/jobs/{job_id}")
@@ -200,6 +263,11 @@ def create_app(config: Config) -> FastAPI:
             return job.to_status()
         job.cancel_requested = True
         if job.process is not None:
+            logger.warning(
+                "job %s: cancel requested, terminating opencode (pid=%s)",
+                job_id,
+                job.process.pid,
+            )
             _terminate(job.process)
         if job.status == "accepted":
             job.status = "canceled"

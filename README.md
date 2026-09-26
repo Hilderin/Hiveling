@@ -31,6 +31,7 @@ examples/          example plans
   history/         per-task artifacts
   runs/            per-run state shown in the dashboard
   worker/          worker workspace (jobs)
+  logs/            worker log (worker.log, rotated)
 ```
 
 ## Install
@@ -224,6 +225,30 @@ Set the opencode binary explicitly if needed:
 ```
 python worker\run.py --port 8787 --opencode-bin "C:\path\to\opencode.exe"
 ```
+
+## Logging
+
+The worker writes a rotating log to `.data/logs/worker.log` (5 MB × 5 files,
+also echoed to stderr). It is designed to make failures diagnosable after the
+fact, up to and including a process that vanished without any console:
+
+- a single `worker starting [pid=…]` line at boot, and a `worker stopped` line
+  on a clean shutdown;
+- a `heartbeat` line every `--heartbeat` seconds (default 60, `0` disables)
+  showing the last time the process was known alive;
+- job lifecycle lines (accepted, start requested, opencode pid/command,
+  exit code, timeout, cancel) and uncaught exceptions with a traceback.
+
+The tail of the file therefore tells the failure mode:
+
+| Last line in the log | Meaning |
+| --- | --- |
+| traceback (`CRITICAL … uncaught exception`) | the worker crashed in Python |
+| `worker stopped` | clean shutdown (Ctrl+C, in-process exit) |
+| a `heartbeat` with no `worker stopped` | the process was killed abruptly (`taskkill /F`, parent session reaping, power loss) |
+
+Flags: `--log-dir` (default `./.data/logs`, env `WORKER_LOG_DIR`) and
+`--log-level` (default `info`, env `WORKER_LOG_LEVEL`).
 
 ## Current limitations
 
