@@ -821,6 +821,26 @@ class Orchestrator:
         )
         return result
 
+    def _substitute_resources(self, task_id: str, resources: list[dict]) -> list[dict]:
+        """Resolve ``{run}`` / ``{task}`` in resource option strings.
+
+        Only task-local substitutions exist. Cross-task references are not
+        supported: a consumer writes the producer's branch name and lists the
+        dependency in ``depends_on`` (see the design doc, section 7.5).
+        """
+        run_id = self.run_id
+
+        def substitute(value):
+            if isinstance(value, str):
+                return value.replace("{run}", run_id).replace("{task}", task_id)
+            if isinstance(value, list):
+                return [substitute(item) for item in value]
+            if isinstance(value, dict):
+                return {key: substitute(item) for key, item in value.items()}
+            return value
+
+        return [substitute(resource) for resource in (resources or [])]
+
     def _execute_on(self, client: WorkerClient, task: Task) -> TaskResult:
         job_id = f"{task.id}-{uuid.uuid4().hex[:8]}"
 
@@ -836,8 +856,9 @@ class Orchestrator:
             "variant": task.variant,
             "title": task.title,
             "env": task.env,
-            "resources": task.resources,
+            "resources": self._substitute_resources(task.id, task.resources),
             "artifacts": task.artifacts,
+            "opencode": task.opencode,
         }
         # 'files' sent to OpenCode is intentionally empty: input files are
         # already extracted into the working directory.

@@ -255,6 +255,15 @@ def execute(job: Job, config: Config) -> None:
     # Provision the task's resources before doing anything else: a validation or
     # prepare failure must abort before OpenCode starts.
     capabilities = _capabilities(config)
+    ctx = Context(
+        workspace=workdir,
+        job_dir=job.dir,
+        task_id=str(job.spec.get("task_id") or job.job_id),
+        run_id=job.spec.get("run_id"),
+        path_roots=list(capabilities.get("path_roots") or []),
+        capabilities=capabilities,
+        secrets=getattr(config, "secrets", None),
+    )
     environment: Environment | None = None
     try:
         resources = parse_resources(job.spec.get("resources"))
@@ -262,19 +271,37 @@ def execute(job: Job, config: Config) -> None:
         _fail_before_start(job, f"environment error: {exc}")
         return
     if resources:
-        ctx = Context(
-            workspace=workdir,
-            job_dir=job.dir,
-            task_id=str(job.spec.get("task_id") or job.job_id),
-            run_id=job.spec.get("run_id"),
-            path_roots=list(capabilities.get("path_roots") or []),
-            capabilities=capabilities,
-        )
         environment = Environment(resources, ctx)
         try:
             environment.prepare()
         except EnvironmentError as exc:
             _fail_before_start(job, f"environment error: {exc}")
+            return
+
+    # Inject the OpenCode runtime config (agents, skills, AGENTS.md, permissions)
+    # at the location directory before OpenCode starts.
+    plan_opencode = job.spec.get("opencode") or {}
+    if plan_opencode or environment is not None or getattr(config, "opencode_dir", None):
+        try:
+            from .opencode_config import inject as inject_opencode
+
+            report = inject_opencode(
+                workdir,
+                plan_opencode=plan_opencode,
+                baseline_dir=getattr(config, "opencode_dir", None),
+                provenance=environment.config_roots() if environment else [],
+                fragments=environment.opencode_fragments if environment else [],
+                ctx=ctx,
+            )
+            logger.info(
+                "job %s: opencode config injected (agents=%d skills=%d agents_md=%d)",
+                job.job_id,
+                len(report.agents),
+                len(report.skills),
+                len(report.agents_md),
+            )
+        except EnvironmentError as exc:
+            _fail_before_start(job, f"opencode config error: {exc}")
             return
 
     # Snapshot *after* provisioning, so a checkout/clean is not reported as a

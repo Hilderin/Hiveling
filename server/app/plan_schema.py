@@ -55,6 +55,34 @@ class ArtifactsInput(BaseModel):
     )
 
 
+class OpencodeSourceInput(BaseModel):
+    """A worker-local OpenCode config source (verbose form)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str = Field(description="bundle | config | agents | skills | agents_md.")
+    path: str = Field(description="Worker-local path (resolved under path_roots).")
+    mode: str | None = Field(default=None, description="auto | symlink | reference | concat | copy.")
+    priority: int | None = Field(default=None, description="Higher wins / concatenates later.")
+    optional: bool | None = Field(default=None, description="Skip a missing path instead of failing.")
+    when: dict | None = Field(default=None, description="Capability guard (reserved).")
+
+
+class OpencodeInput(BaseModel):
+    """Per-job OpenCode runtime config: inline content and worker-local paths."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    config: dict | None = Field(default=None, description="Inline opencode.json fragment (deep-merged).")
+    agents: dict[str, str] | None = Field(default=None, description="Inline agents: name -> markdown body.")
+    skills: list[dict] | None = Field(default=None, description="Inline skills: [{name, content}].")
+    from_: list[str] | None = Field(default=None, alias="from", description="Bundle dirs (opencode.json + agents/ + skills/ + AGENTS.md).")
+    agents_paths: list[str] | None = Field(default=None, description="Worker-local agent directories.")
+    skills_paths: list[str] | None = Field(default=None, description="Worker-local skill directories.")
+    agents_md: list[str] | None = Field(default=None, description="Worker-local AGENTS.md files (concatenated).")
+    sources: list[OpencodeSourceInput] | None = Field(default=None, description="Verbose source list.")
+
+
 class RequirementsInput(BaseModel):
     """Worker capabilities a task needs. Merged over defaults; matched as a subset."""
 
@@ -95,6 +123,9 @@ class DefaultsInput(BaseModel):
     )
     artifacts: ArtifactsInput | None = Field(
         default=None, description="How every task's results are collected."
+    )
+    opencode: OpencodeInput | None = Field(
+        default=None, description="OpenCode runtime config injected for every task (merged with task opencode)."
     )
     max_parallel: int | None = Field(
         default=None,
@@ -137,6 +168,9 @@ class TaskInput(BaseModel):
     )
     artifacts: ArtifactsInput | None = Field(
         default=None, description="How this task's results are collected."
+    )
+    opencode: OpencodeInput | None = Field(
+        default=None, description="OpenCode runtime config injected for this task (merged with defaults)."
     )
 
     @model_validator(mode="after")
@@ -186,6 +220,7 @@ Top-level keys:
   - `resources` (list): resources every task materializes (merged with task
     resources by `id`)
   - `artifacts` (mapping): how every task's results are collected
+  - `opencode` (mapping): OpenCode runtime config injected for every task
   - `max_parallel` (int): max tasks running at once; 0/unset means one per free
     worker
 - `tasks` (required, list). Each task:
@@ -206,10 +241,27 @@ Top-level keys:
   - `resources` (list, merged over defaults by `id`): each entry is
     `{type, id?, when?, with?}`. `type` selects a worker provider; `with` holds
     provider-specific options. Resources are validated and prepared on the
-    worker *before* OpenCode starts. Today the only provider is `ephemeral`
-    (a fresh, isolated working directory: the historical behavior).
+    worker *before* OpenCode starts.
   - `artifacts` (mapping): `download` (`modified`|`all`|`none`) selects the zip
     channel; `git` and `paths` are reserved for later stages.
+  - `opencode` (mapping, merged over defaults): OpenCode runtime config injected
+    at the job's working directory. Either inline (`config`, `agents`,
+    `skills`) or **worker-local paths** (`from` bundles, `agents_paths`,
+    `skills_paths`, `agents_md`, or the verbose `sources` list), so the plan
+    carries paths instead of re-writing agent/skill bodies.
+
+Built-in providers:
+
+- `ephemeral` — a fresh, isolated working directory (the historical behavior).
+- `env` — inject environment variables: `{vars: {NAME: value}}` (values may use
+  `${OTHER}`).
+- `secret` — inject a named secret from the worker store (`{name, as?, required?}`).
+  The plan never carries the value.
+- `git` — `{repo, path, worktree?, ref?, branch?, branch_mode?, push_to?,
+  set_upstream?, force?, clean?, cache?, publish?, remote?}`. `ref` is the start
+  point, `branch` the target the task commits to; `publish` is
+  `none|commit|push`.
+- `path` — expose an existing folder: `{path, mode: ro|rw, visible?}`.
 
 Resource notes:
 
@@ -218,6 +270,11 @@ Resource notes:
   resource gets a generated id and simply accumulates.
 - A resource whose `type` the worker does not implement fails the task at
   prepare, before OpenCode runs, with a clear error.
+- Absolute paths (`git.path`, `path.path`, `opencode` sources) must live under
+  the worker's `path_roots`; relative paths resolve under the job workspace.
+- `{run}` and `{task}` in resource option strings are resolved by the server
+  (task-local only). Cross-task references do not exist: write the producer's
+  branch name and list it in `depends_on`.
 
 Notes:
 

@@ -2,7 +2,12 @@
 
 import pytest
 
-from server.app.plan import PlanError, _merge_resources, load_plan
+from server.app.plan import (
+    PlanError,
+    _merge_opencode,
+    _merge_resources,
+    load_plan,
+)
 
 
 def test_merge_resources_by_id_task_overrides():
@@ -29,6 +34,21 @@ def test_anonymous_resources_accumulate():
 def test_resource_without_type_fails():
     with pytest.raises(PlanError):
         _merge_resources([], [{"id": "x"}])
+
+
+def test_merge_opencode_lists_concat_dicts_merge():
+    defaults = {
+        "opencode": {
+            "from": ["a"],
+            "config": {"x": 1},
+            "agents_paths": ["p"],
+        }
+    }
+    task = {"from": ["b"], "config": {"y": 2}}
+    merged = _merge_opencode(defaults, task)
+    assert merged["from"] == ["a", "b"]
+    assert merged["config"] == {"x": 1, "y": 2}
+    assert merged["agents_paths"] == ["p"]
 
 
 def test_load_plan_merges_resources_and_artifacts(tmp_path):

@@ -36,6 +36,7 @@ class Task:
     requirements: dict = field(default_factory=dict)
     resources: list[dict] = field(default_factory=list)
     artifacts: dict = field(default_factory=dict)
+    opencode: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -123,6 +124,27 @@ def _merge_resources(default_defaults: list | None, task_resources: list | None)
     return [merged[resource_id] for resource_id in order]
 
 
+def _merge_opencode(defaults: dict, override: dict | None) -> dict:
+    """Merge defaults + task OpenCode blocks: dicts merge, lists concatenate."""
+    base = defaults.get("opencode")
+    over = override or {}
+    if not isinstance(base, dict):
+        base = {}
+    merged: dict = {}
+    for key in set(base) | set(over):
+        left = base.get(key)
+        right = over.get(key)
+        if isinstance(left, dict) and isinstance(right, dict):
+            merged[key] = {**left, **right}
+        elif isinstance(left, list) and isinstance(right, list):
+            merged[key] = left + right
+        elif key in over:
+            merged[key] = right
+        else:
+            merged[key] = left
+    return merged
+
+
 def _merge_artifacts(defaults: dict, override: dict | None) -> dict:
     merged: dict = {}
     base = defaults.get("artifacts")
@@ -171,6 +193,7 @@ def _parse_task(raw: dict, defaults: dict, base_dir: Path) -> Task:
         ),
         resources=resources,
         artifacts=artifacts,
+        opencode=_merge_opencode(defaults, raw.get("opencode") or {}),
     )
 
 

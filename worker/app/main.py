@@ -30,6 +30,7 @@ from .capabilities import Capabilities
 from .config import Config
 from .executor import execute, _terminate
 from .files import build_zip, extract_zip, list_files
+from .secrets import SecretStore
 from .state import ACTIVE_STATUSES, TERMINAL_STATUSES, Job, Registry
 
 logger = logging.getLogger("hiveling.worker")
@@ -50,6 +51,7 @@ class JobSpec(BaseModel):
     run_id: str | None = None
     resources: list[dict] = Field(default_factory=list)
     artifacts: dict = Field(default_factory=dict)
+    opencode: dict = Field(default_factory=dict)
 
 
 def _janitor(registry: Registry, config: Config, stop: threading.Event) -> None:
@@ -86,6 +88,7 @@ def create_app(config: Config) -> FastAPI:
     registry.load_from_disk(config.workspace)
     capabilities = Capabilities(config.capabilities_file)
     config.capabilities = capabilities
+    config.secrets = SecretStore(config.secrets_file)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):

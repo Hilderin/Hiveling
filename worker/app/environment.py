@@ -48,6 +48,8 @@ class Context:
     run_id: str | None = None
     path_roots: list[str] = field(default_factory=list)
     capabilities: dict = field(default_factory=dict)
+    # A worker-side SecretStore (resolves names, never values, from the plan).
+    secrets: Any = None
 
 
 @dataclass
@@ -102,9 +104,15 @@ class Provider(Protocol):
 
 def default_registry() -> dict[str, Provider]:
     """Providers implemented by this worker build, keyed by ``type``."""
-    from .providers import ephemeral
+    from .providers import env, ephemeral, git, path, secret
 
-    return {ephemeral.PROVIDER.name: ephemeral.PROVIDER}
+    return {
+        ephemeral.PROVIDER.name: ephemeral.PROVIDER,
+        env.PROVIDER.name: env.PROVIDER,
+        secret.PROVIDER.name: secret.PROVIDER,
+        git.PROVIDER.name: git.PROVIDER,
+        path.PROVIDER.name: path.PROVIDER,
+    }
 
 
 class Environment:
@@ -162,6 +170,15 @@ class Environment:
         """OpenCode config fragments contributed by the prepared resources."""
         return [p.opencode for p in self.prepared if p.opencode]
 
+    def config_roots(self) -> list[tuple[Path, bool]]:
+        """``(root, under_location)`` provenance reported by the providers."""
+        roots: list[tuple[Path, bool]] = []
+        for prepared in self.prepared:
+            root = prepared.state.get("config_root")
+            if root:
+                roots.append((Path(root), bool(prepared.state.get("under_location"))))
+        return roots
+
     def finalize(self, outcome: JobOutcome) -> FinalizeResult:
         """Finalize prepared resources in reverse order (publish results)."""
         merged = FinalizeResult()
@@ -195,6 +212,53 @@ class Environment:
                     prepared.resource.id,
                     exc_info=True,
                 )
+
+
+def check_path_allowed(path: Path, ctx: Context, *, label: str = "path") -> None:
+    """Enforce the worker ``path_roots`` allowlist.
+
+    Relative paths (resolved under the job workspace) and paths inside the
+    workspace are always allowed; an absolute path outside it needs a
+    ``path_roots`` entry (``["*"]`` disables the check explicitly).
+    """
+    if ctx.path_roots == ["*"]:
+        return
+    resolved = path.resolve()
+    workspace = ctx.workspace.resolve()
+    if resolved == workspace or workspace in resolved.parents:
+        return
+    if not ctx.path_roots:
+        raise EnvironmentError(
+            f"{label}: '{path}' is outside the job workspace and the worker has "
+            f"no path_roots configured"
+        )
+    for root in ctx.path_roots:
+        root_path = Path(root).expanduser().resolve()
+        if resolved == root_path or root_path in resolved.parents:
+            return
+    raise EnvironmentError(f"{label}: '{path}' is outside the worker path_roots")
+
+
+def resolve_worker_path(value: str, ctx: Context, *, label: str = "path") -> Path:
+    """Resolve a plan-declared path (relative to the workspace) and check it."""
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = ctx.workspace / path
+    path = path.resolve()
+    check_path_allowed(path, ctx, label=label)
+    return path
+
+
+def external_permissions(path: Path, *, write: bool = True) -> dict:
+    """OpenCode permission rules granting access to a path outside the location."""
+    pattern = str(Path(path).resolve() / "**")
+    rules = [
+        {"action": "read", "resource": pattern, "effect": "allow"},
+        {"action": "external_directory", "resource": pattern, "effect": "allow"},
+    ]
+    if write:
+        rules.append({"action": "edit", "resource": pattern, "effect": "allow"})
+    return {"permissions": rules}
 
 
 def parse_resources(raw_resources: list | None) -> list[Resource]:

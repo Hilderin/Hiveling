@@ -23,7 +23,7 @@ import yaml
 logger = logging.getLogger("hiveling.worker.capabilities")
 
 # Providers implemented by this worker build. Extended as providers land.
-KNOWN_PROVIDERS: tuple[str, ...] = ("ephemeral",)
+KNOWN_PROVIDERS: tuple[str, ...] = ("ephemeral", "env", "secret", "git", "path")
 
 # Tools probed on PATH when advertising capabilities.
 DETECTED_TOOLS: tuple[str, ...] = (

@@ -21,8 +21,11 @@ class Config:
     log_dir: Path
     heartbeat_s: float
     capabilities_file: Path | None = None
-    # Set by create_app: the live Capabilities object (hot-reloaded).
+    secrets_file: Path | None = None
+    opencode_dir: Path | None = None
+    # Set by create_app: live Capabilities / SecretStore objects (hot-reloaded).
     capabilities: Any = None
+    secrets: Any = None
 
     @classmethod
     def from_args(cls, argv: list[str] | None = None) -> "Config":
@@ -87,11 +90,37 @@ class Config:
                 "default ./capabilities.yaml, hot-reloaded"
             ),
         )
+        parser.add_argument(
+            "--secrets-file",
+            default=os.environ.get("WORKER_SECRETS", "secrets.yaml"),
+            help=(
+                "worker secret store (flat name: value mapping); default "
+                "./secrets.yaml, hot-reloaded. The environment is the fallback."
+            ),
+        )
+        parser.add_argument(
+            "--opencode-dir",
+            default=os.environ.get("WORKER_OPENCODE_DIR", "opencode"),
+            help=(
+                "baseline OpenCode bundle on the worker (opencode.json, agents/, "
+                "skills/, AGENTS.md); default ./opencode"
+            ),
+        )
         args = parser.parse_args(argv)
 
         capabilities_file = (
             Path(args.capabilities_file).expanduser().resolve()
             if args.capabilities_file
+            else None
+        )
+        secrets_file = (
+            Path(args.secrets_file).expanduser().resolve()
+            if args.secrets_file
+            else None
+        )
+        opencode_dir = (
+            Path(args.opencode_dir).expanduser().resolve()
+            if args.opencode_dir
             else None
         )
 
@@ -106,4 +135,6 @@ class Config:
             log_dir=Path(args.log_dir).expanduser().resolve(),
             heartbeat_s=args.heartbeat,
             capabilities_file=capabilities_file,
+            secrets_file=secrets_file,
+            opencode_dir=opencode_dir,
         )
