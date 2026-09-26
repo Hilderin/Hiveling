@@ -2,6 +2,9 @@
 
 ## Open
 
+- Worker workspace GC / history retention (prune old job dirs and worktrees)
+- Git integration/merge between worker branches (conflict handling)
+- Plan-authoring skill/docs so an assistant emits explicit Hiveling plans
 - Goal mode / finish_check_prompt / checks
 - Worker capabilities / task requirements
 - Versioned plan mutations

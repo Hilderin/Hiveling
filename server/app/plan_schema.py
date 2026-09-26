@@ -17,6 +17,25 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 DownloadMode = Literal["modified", "all", "none"]
 
 
+class RequirementsInput(BaseModel):
+    """Worker capabilities a task needs. Merged over defaults; matched as a subset."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    os: str | None = Field(
+        default=None, description="Exact OS match: windows | linux | macos."
+    )
+    tags: list[str] | None = Field(
+        default=None, description="Worker tags that must all be present."
+    )
+    providers: list[str] | None = Field(
+        default=None, description="Worker providers that must all be available."
+    )
+    labels: dict[str, str] | None = Field(
+        default=None, description="Worker labels that must match exactly."
+    )
+
+
 class DefaultsInput(BaseModel):
     """Applied to every task unless the task overrides it."""
 
@@ -30,6 +49,9 @@ class DefaultsInput(BaseModel):
     download: DownloadMode | None = Field(default=None, description="modified (default) | all | none.")
     env: dict[str, str] | None = Field(default=None, description="Extra environment variables.")
     files: list[str] | None = Field(default=None, description="Input paths/globs relative to the plan.")
+    requirements: RequirementsInput | None = Field(
+        default=None, description="Worker capabilities every task needs (merged with task-level requirements)."
+    )
     max_parallel: int | None = Field(
         default=None,
         description="Max tasks running at once; 0/unset means one per free worker.",
@@ -62,6 +84,10 @@ class TaskInput(BaseModel):
         description="Task ids whose downloaded files are copied into this task's working directory (also implies ordering).",
     )
     download: DownloadMode | None = Field(default=None, description="modified | all | none.")
+    requirements: RequirementsInput | None = Field(
+        default=None,
+        description="Worker capabilities this task needs (merged over defaults); the task only runs on a matching worker.",
+    )
 
     @model_validator(mode="after")
     def _require_prompt(self) -> "TaskInput":
@@ -106,6 +132,7 @@ Top-level keys:
 - `defaults` (optional mapping), applied to every task unless overridden:
   - `model`, `agent`, `auto` (bool), `timeout_s` (number), `variant`,
     `download` (`modified` | `all` | `none`), `env` (map), `files` (list)
+  - `requirements` (mapping): worker capabilities every task needs
   - `max_parallel` (int): max tasks running at once; 0/unset means one per free
     worker
 - `tasks` (required, list). Each task:
@@ -118,11 +145,19 @@ Top-level keys:
   - `depends_on` (task ids): ordering; the task is skipped if a dependency fails
   - `inputs_from` (task ids): ordering plus copies those tasks' downloaded files
     into this task's working directory
+  - `requirements` (mapping, merged over defaults): only dispatch the task to a
+    matching worker. Keys: `os` (exact: `windows`|`linux`|`macos`), `tags`
+    (all required), `providers` (all required), `labels` (exact per key). With
+    no requirements the task runs on any free worker. Use list_workers to see
+    the capabilities each worker advertises.
 
 Notes:
 
 - `depends_on` and `inputs_from` both imply ordering. Use `inputs_from` to pass
   files from one task to the next; working directories are otherwise independent.
+- `requirements` are matched as a subset: every requested tag/provider/label
+  must be advertised by the worker. A task whose requirements cannot be met by
+  any reachable worker fails fast instead of waiting for a worker.
 - Tasks are topologically sorted by the server; independent tasks run in
   parallel, one per free worker.
 - `download: modified` (default) downloads files the task changed/added,
@@ -145,6 +180,12 @@ defaults:
 tasks:
   - id: hello
     prompt: "Reply with exactly: PONG"
+    download: none
+
+  - id: on-windows
+    prompt: "Reply with the result of: echo %OS%"
+    requirements:
+      os: windows
     download: none
 
   - id: write-report

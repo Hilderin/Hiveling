@@ -33,6 +33,7 @@ class Task:
     depends_on: list[str] = field(default_factory=list)
     inputs_from: list[str] = field(default_factory=list)
     download: str = "modified"  # modified | all | none
+    requirements: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -77,6 +78,26 @@ def _load_prompt(raw: dict, base_dir: Path) -> str:
     return prompt
 
 
+def _merge_requirements(defaults: dict, task: dict) -> dict:
+    """Merge task requirements over defaults (lists union, labels merge by key)."""
+    merged: dict = {}
+    if defaults.get("os") is not None:
+        merged["os"] = str(defaults["os"])
+    for key in ("tags", "providers"):
+        base = [str(x) for x in (defaults.get(key) or [])]
+        extra = [str(x) for x in (task.get(key) or [])]
+        values = list(dict.fromkeys(base + extra))
+        if values:
+            merged[key] = values
+    labels = {str(k): str(v) for k, v in (defaults.get("labels") or {}).items()}
+    labels.update({str(k): str(v) for k, v in (task.get("labels") or {}).items()})
+    if labels:
+        merged["labels"] = labels
+    if task.get("os") is not None:
+        merged["os"] = str(task["os"])
+    return merged
+
+
 def _parse_task(raw: dict, defaults: dict, base_dir: Path) -> Task:
     if not isinstance(raw, dict):
         raise PlanError(f"invalid task: {raw!r}")
@@ -107,6 +128,9 @@ def _parse_task(raw: dict, defaults: dict, base_dir: Path) -> Task:
         depends_on=[str(d) for d in (raw.get("depends_on") or [])],
         inputs_from=[str(d) for d in (raw.get("inputs_from") or [])],
         download=str(pick("download", "modified")),
+        requirements=_merge_requirements(
+            defaults.get("requirements") or {}, raw.get("requirements") or {}
+        ),
     )
 
 
@@ -163,7 +187,7 @@ def load_plan(path: str | Path, *, base_dir: str | Path | None = None) -> Plan:
     if not plan_path.is_file():
         raise PlanError(f"plan not found: {plan_path}")
     try:
-        raw = yaml.safe_load(plan_path.read_text(encoding="utf-8")) or {}
+        raw = yaml.safe_load(plan_path.read_text(encoding="utf-8-sig")) or {}
     except yaml.YAMLError as exc:
         raise PlanError(f"invalid YAML: {exc}") from exc
 

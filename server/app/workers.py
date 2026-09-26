@@ -32,7 +32,7 @@ class WorkerConfigError(Exception):
 def parse_workers_file(path: Path) -> list[WorkerEndpoint]:
     """Read ``workers.yaml`` and return the declared endpoints."""
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        raw = yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
     except yaml.YAMLError as exc:
         raise WorkerConfigError(f"invalid YAML in {path}: {exc}") from exc
     except OSError as exc:
@@ -115,6 +115,7 @@ def probe_workers(registry: WorkerRegistry, timeout: float = 2.0) -> dict:
             "busy": None,
             "active_job": None,
             "opencode_bin": None,
+            "capabilities": {},
         }
         client = WorkerClient(worker, timeout=timeout)
         try:
@@ -124,6 +125,7 @@ def probe_workers(registry: WorkerRegistry, timeout: float = 2.0) -> dict:
                 busy=health.get("busy"),
                 active_job=health.get("active_job"),
                 opencode_bin=health.get("opencode_bin"),
+                capabilities=health.get("capabilities") or {},
             )
         except WorkerError:
             pass

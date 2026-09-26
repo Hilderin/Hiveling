@@ -19,6 +19,7 @@ class Config:
     log_level: str
     log_dir: Path
     heartbeat_s: float
+    capabilities_file: Path | None = None
 
     @classmethod
     def from_args(cls, argv: list[str] | None = None) -> "Config":
@@ -75,7 +76,21 @@ class Config:
             default=float(os.environ.get("WORKER_HEARTBEAT", "60")),
             help="seconds between heartbeat log lines; 0 disables (default: 60)",
         )
+        parser.add_argument(
+            "--capabilities-file",
+            default=os.environ.get("WORKER_CAPABILITIES", "capabilities.yaml"),
+            help=(
+                "worker capabilities file (tags, labels, providers, path_roots); "
+                "default ./capabilities.yaml, hot-reloaded"
+            ),
+        )
         args = parser.parse_args(argv)
+
+        capabilities_file = (
+            Path(args.capabilities_file).expanduser().resolve()
+            if args.capabilities_file
+            else None
+        )
 
         return cls(
             host=args.host,
@@ -87,4 +102,5 @@ class Config:
             log_level=args.log_level,
             log_dir=Path(args.log_dir).expanduser().resolve(),
             heartbeat_s=args.heartbeat,
+            capabilities_file=capabilities_file,
         )

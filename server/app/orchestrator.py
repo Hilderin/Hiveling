@@ -223,9 +223,18 @@ class Orchestrator:
 
                 capacity_blocked = False
                 if not halt:
-                    _, capacity_blocked = self._dispatch_ready(
+                    _, capacity_blocked, requirements_failed = self._dispatch_ready(
                         tasks, results, running, done
                     )
+                    if requirements_failed:
+                        self._log(
+                            "[red]a task has no matching worker, stopping run[/]"
+                        )
+                        logger.warning(
+                            "run %s: a task has no matching worker, stopping run",
+                            self.run_id,
+                        )
+                        halt = True
 
                 if halt and not running:
                     if canceled:
@@ -449,17 +458,24 @@ class Orchestrator:
         results: dict[str, str],
         running: dict[str, tuple[WorkerClient | None, threading.Thread]],
         done: queue.Queue,
-    ) -> tuple[bool, bool]:
-        """Start every ready task that fits on a free worker.
+    ) -> tuple[bool, bool, bool]:
+        """Start every ready task that fits on a matching free worker.
 
-        Returns ``(dispatched, capacity_blocked)``; the latter is True when a
-        ready task had to wait because no worker (or no parallelism slot) was
-        available.
+        Returns ``(dispatched, capacity_blocked, requirements_failed)``:
+        ``capacity_blocked`` is True when a ready task had to wait because no
+        worker (or no parallelism slot) was available, and
+        ``requirements_failed`` is True when a task's ``requirements`` cannot be
+        satisfied by any reachable worker (the task is marked failed).
         """
         dispatched = False
         capacity_blocked = False
+        requirements_failed = False
         known = {task.id for task in tasks} | set(results)
-        available: list[WorkerClient] | None = None
+        # Reachable workers, probed once per pass. ``claimed`` tracks the ones
+        # already taken in this pass so a worker is never offered twice while
+        # still counting as a candidate for requirement matching.
+        available: list[tuple[WorkerClient, dict, bool, bool]] | None = None
+        claimed: set[str] = set()
 
         for task in tasks:
             if task.id in results or task.id in running:
@@ -512,17 +528,85 @@ class Orchestrator:
                 continue
             if available is None:
                 available = self._available_clients(running)
-            if not available:
+
+            pick: WorkerClient | None = None
+            matching_exists = False
+            for offset in range(len(available)):
+                index = (self._rr + offset) % len(available)
+                client, capabilities, busy, reserved = available[index]
+                if not self._matches(task, capabilities):
+                    continue
+                matching_exists = True
+                if busy or reserved or client.base_url in claimed:
+                    continue
+                pick = client
+                self._rr = index + 1
+                break
+
+            if pick is None:
+                if not matching_exists:
+                    # No reachable worker can ever run this task: fail fast
+                    # instead of waiting for the worker timeout.
+                    message = self._no_match_message(task, available)
+                    self._log(f"[red]no matching worker[/] {task.id} [dim]{message}[/]")
+                    logger.warning(
+                        "run %s: task %s has no matching worker (%s)",
+                        self.run_id,
+                        task.id,
+                        message,
+                    )
+                    results[task.id] = "failed"
+                    self._store_task(
+                        task.id,
+                        status="failed",
+                        error=f"no worker matches requirements: {message}",
+                    )
+                    requirements_failed = True
+                    continue
                 capacity_blocked = True
                 continue
 
-            client = available[self._rr % len(available)]
-            self._rr += 1
-            available.remove(client)
-            self._start_task(task, client, running, done)
+            claimed.add(pick.base_url)
+            self._start_task(task, pick, running, done)
             dispatched = True
 
-        return dispatched, capacity_blocked
+        return dispatched, capacity_blocked, requirements_failed
+
+    @staticmethod
+    def _matches(task: Task, capabilities: dict) -> bool:
+        """True when a worker's advertised capabilities satisfy task requirements."""
+        req = task.requirements or {}
+        if not req:
+            return True
+        req_os = req.get("os")
+        if req_os and str(req_os) != str(capabilities.get("os") or ""):
+            return False
+        worker_tags = {str(tag) for tag in (capabilities.get("tags") or [])}
+        if not {str(tag) for tag in (req.get("tags") or [])}.issubset(worker_tags):
+            return False
+        worker_providers = {str(p) for p in (capabilities.get("providers") or [])}
+        if not {str(p) for p in (req.get("providers") or [])}.issubset(worker_providers):
+            return False
+        worker_labels = capabilities.get("labels") or {}
+        for key, value in (req.get("labels") or {}).items():
+            if str(worker_labels.get(key)) != str(value):
+                return False
+        return True
+
+    @staticmethod
+    def _no_match_message(task: Task, available: list) -> str:
+        req = task.requirements or {}
+        seen = [
+            f"{client.endpoint.name}(os={caps.get('os')},"
+            f" tags={','.join(caps.get('tags') or []) or '-'},"
+            f" providers={','.join(caps.get('providers') or []) or '-'}"
+            + (f", labels={caps.get('labels')}" if caps.get("labels") else "")
+            + ")"
+            for client, caps, _busy, _reserved in available
+        ]
+        wanted = ", ".join(f"{key}={value}" for key, value in req.items())
+        reachable = "; ".join(seen) if seen else "none"
+        return f"need [{wanted}] but reachable workers are: {reachable}"
 
     def _fail_no_worker(
         self,
@@ -666,33 +750,39 @@ class Orchestrator:
                     f"[red]unreachable[/] [dim]{exc}[/]"
                 )
 
-    def _free_clients(self, clients: list[WorkerClient]) -> list[WorkerClient]:
-        """Return reachable workers that are not busy."""
-        free: list[WorkerClient] = []
+    def _probe_clients(
+        self, clients: list[WorkerClient]
+    ) -> list[tuple[WorkerClient, dict, bool]]:
+        """Return ``(client, capabilities, busy)`` for every reachable worker."""
+        probed: list[tuple[WorkerClient, dict, bool]] = []
         for client in clients:
             try:
                 health = client.health()
             except WorkerError:
                 continue
-            if not health.get("busy"):
-                free.append(client)
-        return free
+            capabilities = health.get("capabilities") or {}
+            probed.append((client, capabilities, bool(health.get("busy"))))
+        return probed
 
     def _available_clients(
         self, running: dict[str, tuple[WorkerClient | None, threading.Thread]]
-    ) -> list[WorkerClient]:
-        """Reachable workers that are neither reserved nor busy.
+    ) -> list[tuple[WorkerClient, dict, bool, bool]]:
+        """Reachable workers as ``(client, capabilities, busy, reserved)``.
 
-        A worker is reserved as soon as a task of this run is dispatched to it;
+        A worker is *reserved* as soon as a task of this run is dispatched to it;
         that reservation is what keeps two tasks off the same worker even before
-        its ``/health`` reports ``busy``.
+        its ``/health`` reports ``busy``. Reserved and busy workers stay in the
+        list so requirement matching can tell "busy but capable" (wait) from "no
+        capable worker at all" (fail fast).
         """
         reserved = {
             client.base_url for client, _ in running.values() if client is not None
         }
-        return self._free_clients(
-            [c for c in self._sync_clients(keep=reserved) if c.base_url not in reserved]
-        )
+        probed = self._probe_clients(self._sync_clients(keep=reserved))
+        return [
+            (client, capabilities, busy, client.base_url in reserved)
+            for client, capabilities, busy in probed
+        ]
 
     # ------------------------------------------------------------------ tasks
     def _adopt_job(self, task: Task, job: dict) -> TaskResult:

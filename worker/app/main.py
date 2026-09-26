@@ -26,6 +26,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
+from .capabilities import Capabilities
 from .config import Config
 from .executor import execute, _terminate
 from .files import build_zip, extract_zip, list_files
@@ -79,6 +80,7 @@ def _janitor(registry: Registry, config: Config, stop: threading.Event) -> None:
 def create_app(config: Config) -> FastAPI:
     registry = Registry()
     registry.load_from_disk(config.workspace)
+    capabilities = Capabilities(config.capabilities_file)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -94,6 +96,11 @@ def create_app(config: Config) -> FastAPI:
             "application startup: %d job(s) restored from %s",
             len(registry.all()),
             config.workspace,
+        )
+        logger.info(
+            "capabilities: file=%s %s",
+            config.capabilities_file,
+            capabilities.get(),
         )
         try:
             yield
@@ -154,6 +161,7 @@ def create_app(config: Config) -> FastAPI:
             "active_job": active.job_id if active else None,
             "opencode_bin": binary,
             "jobs": len(registry.all()),
+            "capabilities": capabilities.get(),
         }
 
     @app.get("/jobs")

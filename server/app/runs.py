@@ -44,6 +44,7 @@ def build_task_states(plan, only: list[str] | None = None) -> list[dict]:
                 "depends_on": list(task.depends_on),
                 "inputs_from": list(task.inputs_from),
                 "files_spec": list(task.files),
+                "requirements": dict(task.requirements or {}),
                 "download": task.download,
                 "history_rel": None,
                 "worker": None,
