@@ -52,7 +52,8 @@ Typical flow:
 4. retry_task to re-run one task, cancel_run to stop a whole run, cancel_task
    to cancel a single task (running tasks are stopped, pending tasks never run,
    and the run continues).
-5. get_plan / update_plan to inspect or edit a stored plan.
+5. get_plan / update_plan to inspect or edit a stored plan. To edit the plan of
+   a run (even while it runs), use get_run_plan / update_run_plan.
 
 A run is sequential: tasks are dispatched to the first free worker in plan
 order, and a task whose dependencies did not succeed is skipped.
@@ -212,6 +213,46 @@ def create_mcp_server(manager, config) -> MCPServer:
             "content": content,
             "summary": plan_summary(path),
         }
+
+    @mcp.tool()
+    def get_run_plan(run_id: str) -> dict[str, Any]:
+        """Return the plan a run is executing (its snapshot) and a summary.
+
+        This is the plan used by the run, which may differ from the stored plan
+        of the same name after a live edit.
+        """
+        run = manager.store.read(run_id)
+        if run is None:
+            raise ToolError(f"run not found: {run_id}")
+        path = manager.run_plan_file(run_id)
+        if path is None:
+            raise ToolError(f"no plan file for run: {run_id}")
+        base_dir = Path(run["base_dir"]) if run.get("base_dir") else None
+        return {
+            "run_id": run_id,
+            "name": path.name,
+            "path": str(path),
+            "source_path": run.get("plan_path"),
+            "content": path.read_text(encoding="utf-8"),
+            "summary": plan_summary(path, base_dir=base_dir),
+        }
+
+    @mcp.tool()
+    def update_run_plan(run_id: str, content: str) -> dict[str, Any]:
+        """Edit the plan of a run, including while it is running.
+
+        The new YAML is validated then applied between tasks: pending tasks are
+        updated, new tasks are added and scheduled, and pending tasks removed
+        from the plan are canceled. Tasks already running or finished are left
+        untouched. When the run's source plan is editable, it is updated too, so
+        future runs see the change. Use update_plan to edit a stored plan that is
+        not tied to a run.
+        """
+        try:
+            path = manager.update_run_plan(run_id, content)
+        except PlanError as exc:
+            raise ToolError(str(exc)) from exc
+        return {"ok": True, "run_id": run_id, "path": str(path)}
 
     # --------------------------------------------------------------------- runs
     @mcp.tool()

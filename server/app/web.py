@@ -10,7 +10,11 @@ supports an optional bearer token.
 from __future__ import annotations
 
 import json
+import logging
+import os
+import socket
 import threading
+import time
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,9 +39,14 @@ from .readers import read_json, read_text, zip_dir
 from .runs import RunStore, new_run_id
 from .workers import WorkerRegistry, probe_workers
 
+logger = logging.getLogger("hiveling.server.web")
+
 EVENTS_TAIL_LINES = 400
 WORKER_PROBE_TIMEOUT = 2.0
 TASK_TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "skipped"}
+# A run owner is considered alive if it refreshed its heartbeat within this
+# window; otherwise a restart is allowed to recover the run.
+LEASE_TTL_S = 30.0
 
 
 @dataclass
@@ -47,6 +56,7 @@ class DashboardConfig:
     poll_interval: float = 2.0
     worker_wait_timeout: float = 1800.0
     workers_file: Path | None = None
+    heartbeat_s: float = 60.0
     mcp_token: str | None = None
     mcp_allowed_hosts: list[str] = field(default_factory=list)
     mcp_allowed_origins: list[str] = field(default_factory=list)
@@ -81,6 +91,7 @@ class RunManager:
         self.workers = WorkerRegistry(config.workers_path)
         self._active: dict[str, dict] = {}
         self._lock = threading.Lock()
+        self._stop = threading.Event()
 
     def start(
         self,
@@ -93,6 +104,7 @@ class RunManager:
     ) -> str:
         plan = load_plan(plan_path)  # raises PlanError
         run_id = new_run_id()
+        snapshot = self._write_snapshot(run_id, plan.path)
         cancel_event = threading.Event()
         orchestrator = Orchestrator(
             plan,
@@ -109,16 +121,44 @@ class RunManager:
             quiet=True,
             workers_provider=self.workers.get,
             task_cancel_provider=lambda task_id: self._task_cancel_requested(run_id, task_id),
+            plan_path=snapshot,
+            plan_base_dir=plan.base_dir,
+            plan_snapshot=snapshot,
+            owner=self._owner(),
         )
-        thread = threading.Thread(target=orchestrator.run, daemon=True)
+        thread = threading.Thread(target=orchestrator.run, daemon=True, name=f"run-{run_id}")
         with self._lock:
             self._active[run_id] = {
                 "event": cancel_event,
                 "thread": thread,
                 "task_cancels": {},
+                "orchestrator": orchestrator,
             }
+        logger.info(
+            "run %s: starting plan=%s snapshot=%s", run_id, plan.path.name, snapshot
+        )
         thread.start()
         return run_id
+
+    def _write_snapshot(self, run_id: str, source: Path) -> Path:
+        """Copy the validated plan into the run directory (recovery + live edits)."""
+        run_dir = self.store.path(run_id).parent
+        run_dir.mkdir(parents=True, exist_ok=True)
+        target = run_dir / "plan.yaml"
+        try:
+            content = source.read_text(encoding="utf-8")
+        except OSError:
+            content = ""
+        target.write_text(content, encoding="utf-8")
+        return target
+
+    @staticmethod
+    def _owner() -> dict:
+        return {
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "heartbeat_at": time.time(),
+        }
 
     def _task_cancel_requested(self, run_id: str, task_id: str) -> bool:
         with self._lock:
@@ -156,6 +196,8 @@ class RunManager:
         if entry is None:
             return False
         entry["event"].set()
+        self.store.update(run_id, cancel_requested=True)
+        logger.warning("run %s: cancel requested", run_id)
         return True
 
     def is_active(self, run_id: str) -> bool:
@@ -163,25 +205,199 @@ class RunManager:
             entry = self._active.get(run_id)
         return entry is not None and entry["thread"].is_alive()
 
-    def reconcile(self) -> None:
-        """Mark runs left 'running' by a previous server process as interrupted."""
-        for summary in self.store.list(limit=1000):
+    # ----------------------------------------------------------- recovery
+    def recover(self) -> None:
+        """Resume runs left 'running' by a previous server process.
+
+        A run of another *live* server (fresh heartbeat) is left alone. Each
+        recovered run keeps its task statuses, reattaches to any worker job
+        still running, and continues from the first task without a result.
+        """
+        claimed = 0
+        for summary in self.store.list(limit=1_000_000):
             if summary.get("status") != "running":
                 continue
-            run = self.store.read(summary["run_id"])
+            run_id = summary["run_id"]
+            run = self.store.read(run_id)
             if run is None:
                 continue
-            now = time.time()
-            for task in run.get("tasks", []):
-                if task.get("status") == "running":
-                    task.update(status="failed", error="server restarted during the run",
-                                finished_at=now)
-                elif task.get("status") == "pending":
-                    task.update(status="canceled", finished_at=now)
-            run["status"] = "failed"
-            run["error"] = "server restarted during the run"
-            run["finished_at"] = now
-            self.store.write(run)
+            if not self._claim(run_id, run):
+                logger.info("run %s: owned by another live server, skipping recovery", run_id)
+                continue
+            claimed += 1
+            try:
+                self._resume(run)
+            except Exception:
+                logger.exception("run %s: recovery failed", run_id)
+                self.store.update(
+                    run_id,
+                    status="failed",
+                    error="recovery failed",
+                    finished_at=time.time(),
+                )
+        if claimed:
+            logger.info("recovery: %d run(s) resumed", claimed)
+
+    def _claim(self, run_id: str, run: dict) -> bool:
+        owner = run.get("owner") or {}
+        same_process = owner.get("pid") == os.getpid()
+        fresh = (time.time() - (owner.get("heartbeat_at") or 0)) < LEASE_TTL_S
+        if not same_process and fresh:
+            return False
+        self.store.update(run_id, owner=self._owner())
+        return True
+
+    def _resume(self, run: dict) -> None:
+        run_id = run["run_id"]
+        source = run.get("plan_path")
+        base_dir = run.get("base_dir") or (str(Path(source).parent) if source else None)
+        snapshot = run.get("plan_snapshot")
+        plan_file = None
+        for candidate in (snapshot, source):
+            if candidate and Path(candidate).is_file():
+                plan_file = Path(candidate)
+                break
+        if plan_file is None:
+            logger.error("run %s: no plan file to recover from", run_id)
+            self.store.update(
+                run_id, status="failed", error="plan snapshot missing; cannot recover",
+                finished_at=time.time(),
+            )
+            return
+        try:
+            plan = load_plan(plan_file, base_dir=base_dir)
+        except PlanError as exc:
+            logger.error("run %s: invalid plan snapshot: %s", run_id, exc)
+            self.store.update(
+                run_id, status="failed", error=f"invalid plan snapshot: {exc}",
+                finished_at=time.time(),
+            )
+            return
+
+        initial: dict[str, str] = {}
+        resume_jobs: dict[str, dict] = {}
+        for task in run.get("tasks", []):
+            status = task.get("status")
+            if status in TASK_TERMINAL_STATUSES:
+                initial[task["id"]] = status
+            elif status == "running":
+                if task.get("worker_url") and task.get("job_id"):
+                    resume_jobs[task["id"]] = {
+                        "worker": task.get("worker"),
+                        "worker_url": task.get("worker_url"),
+                        "job_id": task.get("job_id"),
+                    }
+                else:
+                    initial[task["id"]] = "failed"
+                    self.store.update_task(
+                        run_id, task["id"], status="failed",
+                        error="cannot resume: missing worker/job id",
+                    )
+
+        cancel_event = threading.Event()
+        if run.get("cancel_requested"):
+            cancel_event.set()
+
+        orchestrator = Orchestrator(
+            plan,
+            history_dir=self.config.history_dir,
+            poll_interval=self.config.poll_interval,
+            keep_going=bool(run.get("keep_going")),
+            worker_wait_timeout=self.config.worker_wait_timeout,
+            only=run.get("only") or None,
+            run_store=self.store,
+            run_id=run_id,
+            cancel_event=cancel_event,
+            inputs_run_id=run.get("inputs_run_id"),
+            quiet=True,
+            workers_provider=self.workers.get,
+            task_cancel_provider=lambda task_id: self._task_cancel_requested(run_id, task_id),
+            plan_path=plan_file,
+            plan_base_dir=base_dir,
+            plan_snapshot=Path(snapshot) if snapshot else plan_file,
+            resume=True,
+            initial_results=initial,
+            resume_jobs=resume_jobs,
+        )
+        thread = threading.Thread(target=orchestrator.run, daemon=True, name=f"run-{run_id}")
+        with self._lock:
+            self._active[run_id] = {
+                "event": cancel_event,
+                "thread": thread,
+                "task_cancels": {},
+                "orchestrator": orchestrator,
+            }
+        logger.info(
+            "run %s: resumed (%d job(s) reattached, %d task(s) already done)",
+            run_id,
+            len(resume_jobs),
+            len(initial),
+        )
+        thread.start()
+
+    # ----------------------------------------------------------- heartbeat
+    def start_heartbeat(self) -> None:
+        if self.config.heartbeat_s <= 0:
+            logger.info("heartbeat: disabled")
+            return
+        thread = threading.Thread(target=self._heartbeat_loop, daemon=True, name="heartbeat")
+        thread.start()
+
+    def stop_heartbeat(self) -> None:
+        self._stop.set()
+
+    def _heartbeat_loop(self) -> None:
+        interval = max(5.0, self.config.heartbeat_s)
+        while not self._stop.wait(interval):
+            with self._lock:
+                tracked = list(self._active)
+            alive: list[str] = []
+            for run_id in tracked:
+                if self.is_active(run_id):
+                    alive.append(run_id)
+                    self.store.update(run_id, owner=self._owner())
+                else:
+                    # The run finished (or its thread died): stop tracking it.
+                    with self._lock:
+                        self._active.pop(run_id, None)
+            logger.info(
+                "heartbeat: active_runs=%d workers=%d",
+                len(alive),
+                len(self.workers.get()),
+            )
+
+    # ------------------------------------------------------- run's plan file
+    def run_plan_file(self, run_id: str) -> Path | None:
+        """The file holding a run's plan: its snapshot, else its source."""
+        run = self.store.read(run_id)
+        if run is None:
+            return None
+        snapshot = run.get("plan_snapshot")
+        if snapshot and Path(snapshot).is_file():
+            return Path(snapshot)
+        source = run.get("plan_path")
+        if source and Path(source).is_file():
+            return Path(source)
+        return None
+
+    def update_run_plan(self, run_id: str, content: str) -> Path:
+        """Apply a live plan edit to a run (snapshot), and to its editable source.
+
+        Raises :class:`PlanError` when the new content is invalid.
+        """
+        run = self.store.read(run_id)
+        if run is None:
+            raise PlanError(f"run not found: {run_id}")
+        target = self.run_plan_file(run_id)
+        if target is None:
+            raise PlanError("no plan file for this run")
+        write_plan(target, content)
+        source = run.get("plan_path")
+        if source and is_editable_plan(self.config.plans_dir, self.config.data_dir, Path(source)):
+            if Path(source).resolve() != target.resolve():
+                write_plan(Path(source), content)
+        logger.info("run %s: plan updated (%s)", run_id, target)
+        return target
 
 
 def _transport_security(config: DashboardConfig) -> TransportSecuritySettings | None:
@@ -210,12 +426,16 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        manager.reconcile()
-        # A mounted sub-app's lifespan never runs, so the host owns the MCP
-        # session manager (without this the first /mcp request fails).
-        async with AsyncExitStack() as stack:
-            await stack.enter_async_context(mcp_server.session_manager.run())
-            yield
+        manager.recover()
+        manager.start_heartbeat()
+        try:
+            # A mounted sub-app's lifespan never runs, so the host owns the MCP
+            # session manager (without this the first /mcp request fails).
+            async with AsyncExitStack() as stack:
+                await stack.enter_async_context(mcp_server.session_manager.run())
+                yield
+        finally:
+            manager.stop_heartbeat()
 
     app = FastAPI(title="Hiveling dashboard", version="1.0.0", lifespan=lifespan)
 
@@ -341,31 +561,34 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
         run = manager.store.read(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="run not found")
-        path = Path(run["plan_path"])
-        if not path.is_file():
+        path = manager.run_plan_file(run_id)
+        if path is None:
             raise HTTPException(status_code=404, detail="plan file no longer exists")
-        if not is_editable_plan(config.plans_dir, config.data_dir, path):
-            raise HTTPException(status_code=403, detail="plan is not editable from the dashboard")
         return run, path
 
     @app.get("/api/runs/{run_id}/plan")
     def api_run_plan_get(run_id: str) -> dict:
-        _, path = run_plan_path(run_id)
+        run, path = run_plan_path(run_id)
+        base_dir = Path(run["base_dir"]) if run.get("base_dir") else None
         return {
             "name": path.name,
             "path": str(path),
+            "source_path": run.get("plan_path"),
+            "snapshot": run.get("plan_snapshot"),
             "content": path.read_text(encoding="utf-8"),
-            "summary": plan_summary(path),
+            "summary": plan_summary(path, base_dir=base_dir),
         }
 
     @app.put("/api/runs/{run_id}/plan")
     def api_run_plan_put(run_id: str, body: SavePlanRequest) -> dict:
-        _, path = run_plan_path(run_id)
+        """Edit a run's plan (live: applied between tasks; also writes the source)."""
         try:
-            write_plan(path, body.content)
+            path = manager.update_run_plan(run_id, body.content)
         except PlanError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"ok": True}
+            detail = str(exc)
+            status = 404 if detail.startswith("run not found") else 400
+            raise HTTPException(status_code=status, detail=detail) from exc
+        return {"ok": True, "path": str(path)}
 
     # ------------------------------------------------------------------ tasks
     def task_history_dir(run: dict, task_id: str) -> Path | None:

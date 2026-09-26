@@ -7,6 +7,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 from pathlib import Path
@@ -15,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import uvicorn  # noqa: E402
 
+from app.logging_setup import log_shutdown, log_startup, setup_logging  # noqa: E402
 from app.web import DashboardConfig, RunManager, create_app  # noqa: E402
 
 
@@ -44,6 +46,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="max time (s) to wait for a free worker",
     )
     parser.add_argument(
+        "--log-dir",
+        default=os.environ.get("HIVELING_LOG_DIR"),
+        help="directory for the rotating server log (default: <data-dir>/logs)",
+    )
+    parser.add_argument(
+        "--heartbeat",
+        type=float,
+        default=float(os.environ.get("HIVELING_HEARTBEAT", "60")),
+        help="seconds between heartbeat log lines; 0 disables (default: 60)",
+    )
+    parser.add_argument(
         "--mcp-token",
         default=os.environ.get("HIVELING_TOKEN"),
         help="bearer token required on /mcp (default: $HIVELING_TOKEN; empty disables auth)",
@@ -67,6 +80,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     data_dir = Path(args.data_dir).expanduser().resolve()
+    log_dir = Path(args.log_dir).expanduser().resolve() if args.log_dir else data_dir / "logs"
+    log_path = setup_logging(log_dir, args.log_level)
+    logger = logging.getLogger("hiveling.server")
+
     plans_dir = (
         Path(args.plans_dir).expanduser().resolve()
         if args.plans_dir
@@ -81,6 +98,7 @@ def main(argv: list[str] | None = None) -> None:
         poll_interval=args.poll_interval,
         worker_wait_timeout=args.worker_wait,
         workers_file=workers_file,
+        heartbeat_s=args.heartbeat,
         mcp_token=args.mcp_token,
         mcp_allowed_hosts=args.mcp_allowed_host or [],
         mcp_allowed_origins=args.mcp_allowed_origin or [],
@@ -88,9 +106,32 @@ def main(argv: list[str] | None = None) -> None:
     config.history_dir.mkdir(parents=True, exist_ok=True)
     config.runs_dir.mkdir(parents=True, exist_ok=True)
 
-    manager = RunManager(config)
-    app = create_app(config, manager)
-    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+    log_startup(
+        host=args.host,
+        port=args.port,
+        data_dir=data_dir,
+        workers_file=config.workers_path,
+        log_file=log_path,
+        heartbeat_s=args.heartbeat,
+    )
+
+    try:
+        manager = RunManager(config)
+        app = create_app(config, manager)
+        # log_config=None keeps our root logging config (uvicorn loggers
+        # propagate to it) instead of uvicorn replacing it.
+        uvicorn.run(
+            app,
+            host=args.host,
+            port=args.port,
+            log_level=args.log_level,
+            log_config=None,
+        )
+    except BaseException:
+        logger.exception("server crashed with an unhandled exception")
+        raise
+    finally:
+        log_shutdown("server stopped")
 
 
 if __name__ == "__main__":

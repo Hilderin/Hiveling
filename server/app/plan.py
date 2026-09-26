@@ -151,7 +151,14 @@ def _validate_and_order(tasks: list[Task]) -> list[Task]:
     return ordered
 
 
-def load_plan(path: str | Path) -> Plan:
+def load_plan(path: str | Path, *, base_dir: str | Path | None = None) -> Plan:
+    """Load and validate a plan.
+
+    ``base_dir`` overrides the directory used to resolve ``prompt_file`` and
+    ``files``. It is needed when the plan is read from a run's snapshot (which
+    lives under ``.data/runs/<id>/``) while its relative paths still refer to
+    the original plan directory.
+    """
     plan_path = Path(path).expanduser().resolve()
     if not plan_path.is_file():
         raise PlanError(f"plan not found: {plan_path}")
@@ -174,12 +181,15 @@ def load_plan(path: str | Path) -> Plan:
         raise PlanError("'tasks' is required")
     defaults = raw.get("defaults") or {}
 
-    tasks = [_parse_task(entry, defaults, plan_path.parent) for entry in tasks_raw]
+    resolve_base = (
+        Path(base_dir).expanduser().resolve() if base_dir else plan_path.parent
+    )
+    tasks = [_parse_task(entry, defaults, resolve_base) for entry in tasks_raw]
     ordered = _validate_and_order(tasks)
 
     return Plan(
         path=plan_path,
-        base_dir=plan_path.parent,
+        base_dir=resolve_base,
         version=int(raw.get("version", 1)),
         defaults=defaults,
         tasks=ordered,

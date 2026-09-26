@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import glob
 import io
+import logging
 import threading
 import time
 import uuid
@@ -21,11 +22,14 @@ from rich.console import Console
 from rich.table import Table
 
 from .history import History
-from .plan import Plan, PlanError, Task, WorkerEndpoint
+from .plan import Plan, PlanError, Task, WorkerEndpoint, load_plan
 from .runs import RunStore, build_task_states, new_run_id
 from .worker_client import WorkerBusy, WorkerClient, WorkerError
 
+logger = logging.getLogger("hiveling.server.orchestrator")
+
 TERMINAL_STATUSES = {"succeeded", "failed", "canceled"}
+TASK_TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "skipped"}
 
 
 @dataclass
@@ -33,6 +37,7 @@ class TaskResult:
     task_id: str
     status: str
     worker: str | None = None
+    worker_url: str | None = None
     job_id: str | None = None
     duration_s: float | None = None
     files: list[str] = field(default_factory=list)
@@ -61,6 +66,13 @@ class Orchestrator:
         workers: list[WorkerEndpoint] | None = None,
         workers_provider: Callable[[], list[WorkerEndpoint]] | None = None,
         task_cancel_provider: Callable[[str], bool] | None = None,
+        plan_path: Path | None = None,
+        plan_base_dir: Path | None = None,
+        plan_snapshot: Path | None = None,
+        owner: dict | None = None,
+        resume: bool = False,
+        initial_results: dict[str, str] | None = None,
+        resume_jobs: dict[str, dict] | None = None,
     ) -> None:
         self.plan = plan
         self.history = History(history_dir)
@@ -79,8 +91,25 @@ class Orchestrator:
         self.workers = list(workers or [])
         self.workers_provider = workers_provider
         self.task_cancel_provider = task_cancel_provider
+        # Live plan editing: the run reads this file between tasks.
+        self.plan_path = Path(plan_path) if plan_path else plan.path
+        self.plan_base_dir = Path(plan_base_dir) if plan_base_dir else plan.base_dir
+        self.plan_snapshot = Path(plan_snapshot) if plan_snapshot else None
+        self.owner = owner
+        self.resume = resume
+        self.initial_results = dict(initial_results or {})
+        self.resume_jobs = dict(resume_jobs or {})
+        self._plan_stamp = self._stamp(self.plan_path)
         self._clients: dict[str, WorkerClient] = {}
         self._rr = 0  # round-robin across workers
+
+    @staticmethod
+    def _stamp(path: Path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
 
     # ------------------------------------------------------------------ public
     def _log(self, message: str) -> None:
@@ -107,7 +136,7 @@ class Orchestrator:
             self._print_plan()
             return 0
 
-        if self.run_store is not None:
+        if self.run_store is not None and not self.resume:
             self.run_store.create(
                 self.run_id,
                 plan_path=str(self.plan.path),
@@ -116,30 +145,50 @@ class Orchestrator:
                 keep_going=self.keep_going,
                 tasks=build_task_states(self.plan, sorted(self.only) if self.only else None),
                 inputs_run_id=self.inputs_run_id,
+                plan_snapshot=str(self.plan_snapshot) if self.plan_snapshot else None,
+                base_dir=str(self.plan_base_dir),
+                owner=self.owner,
+            )
+            logger.info(
+                "run %s: created (plan=%s snapshot=%s tasks=%d)",
+                self.run_id,
+                self.plan.path.name,
+                self.plan_snapshot,
+                len(self.plan.tasks),
             )
 
         if not self._current_workers():
             self._log("[yellow]no workers configured (workers.yaml)[/]")
+            logger.warning("run %s: no workers configured (workers.yaml)", self.run_id)
 
-        results: dict[str, str] = {}
+        results: dict[str, str] = dict(self.initial_results)
         canceled = False
         try:
             self._print_workers()
-            tasks = self.plan.tasks
-            for index, task in enumerate(tasks):
-                if self.only is not None and task.id not in self.only:
-                    continue
+            # The task list is re-derived from the (possibly edited) plan at the
+            # top of every iteration, so live edits apply between tasks.
+            while True:
+                self._refresh_plan()
+                tasks = [
+                    t for t in self.plan.tasks if self.only is None or t.id in self.only
+                ]
+                task = next((t for t in tasks if t.id not in results), None)
+                if task is None:
+                    break
+
                 if self._is_canceled():
                     canceled = True
-                    for remaining in tasks[index:]:
-                        if self.only is not None and remaining.id not in self.only:
+                    for remaining in tasks:
+                        if remaining.id in results:
                             continue
                         results[remaining.id] = "canceled"
                         self._store_task(remaining.id, status="canceled", error="canceled by user")
+                    logger.warning("run %s: canceled by user", self.run_id)
                     break
 
                 if self._task_is_canceled(task.id):
                     self._log(f"[yellow]canceled[/] {task.id} [dim](canceled while pending)[/]")
+                    logger.info("run %s: task %s canceled while pending", self.run_id, task.id)
                     results[task.id] = "canceled"
                     self._store_task(task.id, status="canceled", error="canceled by user")
                     continue
@@ -155,6 +204,12 @@ class Orchestrator:
                         f"[yellow]skip[/] {task.id} [dim](unsatisfied dependencies: "
                         f"{', '.join(failed_deps)})[/]"
                     )
+                    logger.info(
+                        "run %s: task %s skipped (unsatisfied deps: %s)",
+                        self.run_id,
+                        task.id,
+                        ", ".join(failed_deps),
+                    )
                     results[task.id] = "skipped"
                     self._store_task(
                         task.id,
@@ -165,6 +220,7 @@ class Orchestrator:
 
                 result = self._run_task(task)
                 results[task.id] = result.status
+                logger.info("run %s: task %s -> %s", self.run_id, task.id, result.status)
                 if result.status == "canceled" and self._is_canceled():
                     canceled = True
                 stop_run = result.status != "succeeded" and not self.keep_going
@@ -185,8 +241,69 @@ class Orchestrator:
         status = self._final_status(results, canceled)
         if self.run_store is not None:
             self.run_store.update(self.run_id, status=status, finished_at=time.time())
+        logger.info(
+            "run %s: finished status=%s results=%s", self.run_id, status, results
+        )
 
         return self._summary(results)
+
+    # ------------------------------------------------------------ live edits
+    def _refresh_plan(self) -> None:
+        """Reload the run's plan if it changed on disk, applying pending edits."""
+        if self.run_store is None:
+            return
+        stamp = self._stamp(self.plan_path)
+        if stamp == self._plan_stamp:
+            return
+        self._plan_stamp = stamp
+        if stamp is None:
+            logger.warning("run %s: plan file disappeared: %s", self.run_id, self.plan_path)
+            return
+        try:
+            plan = load_plan(self.plan_path, base_dir=self.plan_base_dir)
+        except PlanError as exc:
+            logger.warning("run %s: plan edit ignored (invalid): %s", self.run_id, exc)
+            return
+
+        added, removed = self._apply_plan(plan)
+        self.plan = plan
+        if added or removed:
+            logger.info(
+                "run %s: plan updated (added=%s removed=%s)",
+                self.run_id,
+                added or "-",
+                removed or "-",
+            )
+
+    def _apply_plan(self, plan: Plan) -> tuple[list[str], list[str]]:
+        """Reconcile run.json tasks with a freshly loaded plan.
+
+        New tasks are appended as pending; pending tasks that disappeared from
+        the plan are marked canceled. Terminal/running tasks are never touched.
+        """
+        run = self.run_store.read(self.run_id)
+        if run is None:
+            return [], []
+        only = sorted(self.only) if self.only else None
+        new_states = {state["id"]: state for state in build_task_states(plan, only)}
+        existing = {task.get("id") for task in run.get("tasks", [])}
+
+        added: list[str] = []
+        for task_id, state in new_states.items():
+            if task_id not in existing:
+                run["tasks"].append(state)
+                added.append(task_id)
+
+        removed: list[str] = []
+        for task in run.get("tasks", []):
+            if task.get("id") not in new_states and task.get("status") == "pending":
+                task["status"] = "canceled"
+                task["error"] = "removed from plan"
+                removed.append(task["id"])
+
+        if added or removed:
+            self.run_store.write(run)
+        return added, removed
 
     def _cancel_pending_tasks(self) -> None:
         if self.run_store is None:
@@ -289,6 +406,9 @@ class Orchestrator:
 
     # ------------------------------------------------------------------ tasks
     def _run_task(self, task: Task) -> TaskResult:
+        resume = self.resume_jobs.get(task.id)
+        if resume:
+            return self._adopt_job(task, resume)
         while True:
             client = self._wait_for_worker(task)
             if client is None:
@@ -304,17 +424,41 @@ class Orchestrator:
                 continue
             except PlanError as exc:
                 self._log(f"[red]plan error:[/] {exc}")
-                result = TaskResult(task.id, "failed", worker=client.endpoint.name, error=str(exc))
+                result = TaskResult(task.id, "failed", worker=client.endpoint.name,
+                                    worker_url=client.base_url, error=str(exc))
             except WorkerError as exc:
                 self._log(f"[red]worker error:[/] {exc}")
-                result = TaskResult(task.id, "failed", worker=client.endpoint.name, error=str(exc))
+                result = TaskResult(task.id, "failed", worker=client.endpoint.name,
+                                    worker_url=client.base_url, error=str(exc))
             return self._record_result(result)
+
+    def _adopt_job(self, task: Task, job: dict) -> TaskResult:
+        """Reattach to a job left running by a previous server process."""
+        url = job.get("worker_url")
+        job_id = job.get("job_id")
+        name = job.get("worker") or url or "worker"
+        if not url or not job_id:
+            logger.error("run %s: task %s cannot resume (missing worker/job id)", self.run_id, task.id)
+            return self._record_result(
+                TaskResult(task.id, "failed", error="cannot resume: missing worker/job id")
+            )
+        logger.info("run %s: task %s reattaching to %s job %s", self.run_id, task.id, name, job_id)
+        self._log(f"[bold cyan]{task.id}[/] reattaching to [bold]{name}[/] [dim]({job_id})[/]")
+        client = WorkerClient(WorkerEndpoint(name=name, url=url))
+        self._clients[url] = client
+        try:
+            result = self._finish_job(client, task, job_id, request={})
+        except WorkerError as exc:
+            result = TaskResult(task.id, "failed", worker=name, worker_url=url,
+                                job_id=job_id, error=f"resume failed: {exc}")
+        return self._record_result(result)
 
     def _record_result(self, result: TaskResult) -> TaskResult:
         self._store_task(
             result.task_id,
             status=result.status,
             worker=result.worker,
+            worker_url=result.worker_url,
             job_id=result.job_id,
             duration_s=result.duration_s,
             changed_files=result.files,
@@ -345,7 +489,16 @@ class Orchestrator:
         inputs = self._resolve_inputs(task)
 
         client.create_job(spec)  # raises WorkerBusy when busy
-        self._store_task(task.id, status="running", worker=client.endpoint.name, job_id=job_id)
+        self._store_task(task.id, status="running", worker=client.endpoint.name,
+                         worker_url=client.base_url, job_id=job_id)
+        logger.info(
+            "run %s: task %s dispatched to %s (job %s, model %s)",
+            self.run_id,
+            task.id,
+            client.endpoint.name,
+            job_id,
+            task.model or "default",
+        )
         self._log(
             f"[bold cyan]{task.id}[/] -> [bold]{client.endpoint.name}[/] "
             f"[dim]({job_id}, model {task.model or 'default'})[/]"
@@ -356,6 +509,12 @@ class Orchestrator:
             client.upload_files(job_id, self._zip_inputs(inputs))
 
         client.start_job(job_id)
+        return self._finish_job(client, task, job_id, request=request)
+
+    def _finish_job(
+        self, client: WorkerClient, task: Task, job_id: str, request: dict
+    ) -> TaskResult:
+        """Poll a job to completion, then save its artifacts and result."""
         status = self._poll(client, job_id, task)
 
         logs: dict | None = None
@@ -381,10 +540,19 @@ class Orchestrator:
         )
 
         self._print_result(status, directory)
+        state = status.get("status", "failed")
+        logger.info(
+            "run %s: task %s finished status=%s duration=%ss",
+            self.run_id,
+            task.id,
+            state,
+            status.get("duration_s"),
+        )
         return TaskResult(
             task_id=task.id,
-            status=status.get("status", "failed"),
+            status=state,
             worker=client.endpoint.name,
+            worker_url=client.base_url,
             job_id=job_id,
             duration_s=status.get("duration_s"),
             files=sorted(set(status.get("added", [])) | set(status.get("modified", []))),
@@ -412,8 +580,28 @@ class Orchestrator:
                 status = client.get_job(job_id)
                 transient = 0
             except WorkerError as exc:
+                if "HTTP 404" in str(exc):
+                    logger.warning(
+                        "run %s: task %s job %s disappeared from worker %s",
+                        self.run_id,
+                        task.id,
+                        job_id,
+                        client.endpoint.name,
+                    )
+                    return {
+                        "job_id": job_id,
+                        "status": "failed",
+                        "error": f"job not found on worker: {exc}",
+                    }
                 transient += 1
                 if transient > 10:
+                    logger.warning(
+                        "run %s: task %s worker %s unreachable after %d tries",
+                        self.run_id,
+                        task.id,
+                        client.endpoint.name,
+                        transient,
+                    )
                     return {
                         "job_id": job_id,
                         "status": "failed",
@@ -425,6 +613,13 @@ class Orchestrator:
             current = status.get("status")
             if current != last_status:
                 self._log(f"  [dim]status: {current} ({time.time() - started:.0f}s)[/]")
+                logger.debug(
+                    "run %s: task %s status=%s (%.0fs)",
+                    self.run_id,
+                    task.id,
+                    current,
+                    time.time() - started,
+                )
                 last_status = current
 
             if current in TERMINAL_STATUSES:

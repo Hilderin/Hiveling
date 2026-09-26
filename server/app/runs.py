@@ -98,12 +98,22 @@ class RunStore:
         keep_going: bool,
         tasks: list[dict],
         inputs_run_id: str | None = None,
+        plan_snapshot: str | None = None,
+        base_dir: str | None = None,
+        owner: dict | None = None,
     ) -> dict:
         now = time.time()
         run = {
             "run_id": run_id,
             "plan_path": plan_path,
             "plan_name": plan_name,
+            # Immutable copy of the plan this run executes; recovery and live
+            # edits read and write this file, never the original.
+            "plan_snapshot": plan_snapshot,
+            # Directory relative paths in the plan resolve against.
+            "base_dir": base_dir,
+            "owner": owner,
+            "cancel_requested": False,
             "only": only or [],
             "keep_going": keep_going,
             "inputs_run_id": inputs_run_id,
@@ -191,12 +201,14 @@ class RunStore:
             "run_id": run.get("run_id"),
             "plan_name": run.get("plan_name"),
             "plan_path": run.get("plan_path"),
+            "plan_snapshot": run.get("plan_snapshot"),
             "status": run.get("status"),
             "created_at": run.get("created_at"),
             "started_at": run.get("started_at"),
             "finished_at": run.get("finished_at"),
             "only": run.get("only") or [],
             "keep_going": run.get("keep_going"),
+            "cancel_requested": bool(run.get("cancel_requested")),
             "counts": _counts(tasks),
             "task_count": len(tasks),
         }

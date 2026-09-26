@@ -57,9 +57,9 @@ def is_editable_plan(plans_dir: Path, data_dir: Path, path: Path) -> bool:
     return False
 
 
-def plan_summary(path: Path) -> dict:
+def plan_summary(path: Path, base_dir: Path | None = None) -> dict:
     try:
-        plan = load_plan(path)
+        plan = load_plan(path, base_dir=base_dir)
         return {
             "tasks": [
                 {

@@ -23,9 +23,14 @@ V1 characteristics:
   optional bearer token.
 - An MCP (Streamable HTTP) endpoint lets a local OpenCode start and monitor
   runs with typed tools (see [MCP server](#mcp-server)).
+- Runs are durable: each run snapshots its plan and records per-task state on
+  disk, so a restarted server **recovers in-flight runs** (reattaching to worker
+  jobs that are still running) instead of losing them.
+- A run's plan can be **edited while it runs**; changes apply to pending tasks
+  between steps.
 - No live streaming: the server polls the worker every few seconds.
-- Everything is stored on disk under `.data/` (server history and
-  worker workspace).
+- Everything is stored on disk under `.data/` (server history, logs and worker
+  workspace).
 
 ## Layout
 
@@ -38,6 +43,8 @@ examples/          example plans
   workers.yaml     workers the server dispatches to (hot-reloaded)
   history/         per-task artifacts
   runs/            per-run state shown in the dashboard
+    <run_id>/      run.json, plan.yaml (snapshot), owner lease
+  logs/            rotating server.log and worker.log
   worker/          worker workspace (jobs)
   logs/            worker log (worker.log, rotated)
 ```
@@ -137,7 +144,8 @@ The layout:
 
 Runs are started by **pushing a plan over HTTP** (there is no run form in the
 UI). Runs execute in background threads; if the dashboard restarts while a run
-is active, that run is reconciled to `failed` (interrupted).
+is active, that run is **recovered** on the next startup (see
+[Persistence, recovery and live edits](#persistence-recovery-and-live-edits)).
 
 Deep links: `?run=<run_id>`, `?run=<run_id>&task=<task_id>`, `?view=history`.
 
@@ -171,7 +179,8 @@ OpenCode ──MCP/HTTP──▶ http://127.0.0.1:8080/mcp ──▶ RunManager 
 | Tool | Description |
 | --- | --- |
 | `list_plans` | available plans (relative name, workers, task ids) |
-| `get_plan` / `update_plan` | read / replace a plan's YAML (validated before writing) |
+| `get_plan` / `update_plan` | read / replace a stored plan's YAML (validated before writing) |
+| `get_run_plan` / `update_run_plan` | read / live-edit the plan a run is executing |
 | `get_plan_schema` | full `plan.yaml` reference plus a canonical example |
 | `create_plan` | create a plan from a **structured** plan object (typed input schema) |
 | `run_plan` | start a run from a plan name or inline YAML; returns `run_id` immediately |
@@ -182,6 +191,10 @@ OpenCode ──MCP/HTTP──▶ http://127.0.0.1:8080/mcp ──▶ RunManager 
 | `cancel_task` | cancel one task: stop it if running, or skip it if pending; the run continues |
 | `retry_task` | re-run a single task (new run with `only=[task]`) |
 | `list_workers` | reachable/busy state of the workers from `workers.yaml` |
+
+`update_run_plan` edits a run's plan live (see
+[Persistence, recovery and live edits](#persistence-recovery-and-live-edits));
+`update_plan` edits a stored plan for future runs.
 
 ### Teaching the plan format
 
@@ -206,8 +219,8 @@ authoring a plan. `update_plan` remains available for raw YAML.
 immediately, and you poll `get_run`/`get_task` for progress. Cancellation is
 per task or per run: `cancel_task` stops the task's worker job (or skips a
 pending task) and the run continues — dependent tasks are skipped — while
-`cancel_run` stops everything. Plan edits apply to the next run (and to
-`retry_task`), not to a run already in flight.
+`cancel_run` stops everything. `update_run_plan` edits a run's plan live;
+`update_plan` edits a stored plan for future runs.
 
 ### Configure OpenCode
 
@@ -337,6 +350,60 @@ workers:
   worker list and surfaces an error in the dashboard and `list_workers`.
 - Each task is dispatched to the first free reachable worker (round-robin).
 
+## Persistence, recovery and live edits
+
+Each run is durable. Under `.data/runs/<run_id>/`:
+
+- `run.json` — run status plus every task state (status, `worker`,
+  `worker_url`, `job_id`, `history_rel`);
+- `plan.yaml` — a copy of the plan the run executes. Relative paths
+  (`prompt_file`, `files`) still resolve against the original plan directory
+  (`base_dir`), so the copy is safe;
+- `owner` — pid/host/heartbeat lease so two servers never run the same run.
+
+**Restart recovery.** On startup the server looks for runs left `running`
+(`RunManager.recover`). Unless another live server owns one (fresh heartbeat),
+it keeps every terminal task as-is, and:
+
+- a task that was `running` is **reattached** to its worker job
+  (`GET /jobs/{id}`) and its result adopted — worker jobs keep running while the
+  server is down, so they are not lost;
+- it is marked `failed` only if the job/worker is gone or unreachable;
+- the run then continues from the first task without a result.
+
+So an abrupt `kill -9` of the server is recoverable. Only a worker that also
+restarted loses its in-flight job (that task is then failed). Runs without a
+snapshot (older format) fall back to their `plan_path`.
+
+**Live plan editing.** `PUT /api/runs/{id}/plan` (MCP `update_run_plan`)
+validates the new YAML, writes the run's snapshot, and updates the source plan
+file when it is editable. The orchestrator re-reads the snapshot between tasks:
+
+- a `pending` task whose definition changed uses the new definition;
+- new tasks are added `pending` and scheduled;
+- `pending` tasks removed from the plan are marked `canceled`
+  ("removed from plan");
+- tasks already `running` or terminal are never touched.
+
+Editing never interrupts the task currently running; changes land before the
+next task starts.
+
+## Logs
+
+Both apps write a rotating log under `.data/logs/` (`server.log` and
+`worker.log`). The server log records startup, run/task lifecycle, dispatches,
+worker errors, recovery and live edits, plus a periodic heartbeat; uncaught
+exceptions (main thread and worker threads) are logged with a traceback.
+
+- `server/dashboard.py --log-dir <dir>` (default `<data-dir>/logs`) and
+  `--heartbeat <s>` (default 60; 0 disables).
+- `server/run.py --log-dir <dir>` and `--log-level <level>`.
+
+The end of the file tells an abrupt kill from a crash: a traceback is a Python
+crash, `server stopped` is a clean shutdown, and a trailing heartbeat with no
+stop line means the process was killed abruptly — exactly the case recovery
+handles.
+
 ## HTTP protocol (worker)
 
 | Method | Path | Description |
@@ -418,8 +485,11 @@ Flags: `--log-dir` (default `./.data/logs`, env `WORKER_LOG_DIR`) and
 - Runs can be stopped as a whole (`cancel_run`) and individual tasks can be
   canceled (`cancel_task`); a canceled task makes the run finish as `failed` if
   no other outcome overrides it.
-- Editing a plan affects the next run and `retry_task`, not a run already in
-  flight (the plan is loaded once at run start).
+- Recovery requires the worker to still hold the job: if the worker restarted
+  too, the in-flight task is marked `failed` (an in-flight task is not retried
+  automatically).
+- Live plan edits apply between tasks; a task already `running` is never
+  interrupted.
 - Task working directories are independent: use `inputs_from` to pass files
   between tasks.
 - Long prompts are passed as command-line arguments (Windows command-line
