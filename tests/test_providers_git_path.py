@@ -358,3 +358,48 @@ def test_git_finalize_reconciles_a_parallel_push(tmp_path, bare_repo):
     ).stdout
     assert "a.txt" in listing
     assert "b.txt" in listing
+
+
+def test_git_finalize_retries_a_push_rejected_after_reconcile(
+    tmp_path, bare_repo, monkeypatch
+):
+    """If the remote advances between the pre-push reconcile and the push, the
+    push is rejected; finalize must reconcile and retry, not crash.
+
+    The pre-push reconcile is made a no-op on its first call to reproduce that
+    race deterministically. Before the fix `finalize` raised a
+    ``CalledProcessError`` from the rejected push and never reached the retry.
+    """
+    _ctxB, envB = _prepare(tmp_path / "jobB", bare_repo, task_id="taskB")
+    workB = Path(envB.prepared[0].state["repo_dir"])
+    assert envB.prepared[0].state["resumed"] is False
+
+    _ctxA, envA = _prepare(tmp_path / "jobA", bare_repo, task_id="taskA")
+    workA = Path(envA.prepared[0].state["repo_dir"])
+    (workA / "a.txt").write_text("a", encoding="utf-8")
+    envA.finalize(JobOutcome(status="succeeded", succeeded=True, workdir=workA))
+    envA.teardown()
+
+    from worker.app.providers.git import GitProvider
+
+    real = GitProvider._reconcile_remote
+    calls = {"n": 0}
+
+    def flaky(self, repo, branch, remote, ctx):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return  # pretend the pre-push reconcile missed the advance
+        return real(self, repo, branch, remote, ctx)
+
+    monkeypatch.setattr(GitProvider, "_reconcile_remote", flaky)
+
+    (workB / "b.txt").write_text("b", encoding="utf-8")
+    result = envB.finalize(JobOutcome(status="succeeded", succeeded=True, workdir=workB))
+    assert result.commits and result.commits[0]["pushed"] is True
+
+    listing = git(
+        tmp_path, "--git-dir", str(bare_repo), "ls-tree", "-r", "--name-only",
+        "hiveling/r1/feature",
+    ).stdout
+    assert "a.txt" in listing
+    assert "b.txt" in listing

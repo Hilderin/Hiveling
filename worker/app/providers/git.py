@@ -580,12 +580,14 @@ class GitProvider:
         if force:
             push_args.append("--force")
         push_args += [remote, f"{branch}:{push_to}"]
-        pushed = _git(push_args, repo)
+        # `check=False`: a rejected push must reach the reconcile-and-retry
+        # below instead of raising a CalledProcessError out of `_git`.
+        pushed = _run(push_args, repo)
         if pushed.returncode != 0 and not force:
             # Lost a race with another task on the shared branch: reconcile
             # again and retry once.
             self._reconcile_remote(repo, push_to, remote, ctx)
-            pushed = _git(push_args, repo)
+            pushed = _run(push_args, repo)
         if pushed.returncode != 0:
             raise EnvironmentError(
                 f"git: push failed: {pushed.stderr.strip()[-500:]}"
