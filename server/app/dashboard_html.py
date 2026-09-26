@@ -357,7 +357,7 @@ function renderTree(tasks) {
     const model = t.model ? ` <span class="badge" title="model">${esc(t.model)}</span>` : '';
     const worker = t.worker ? ` <span class="badge worker" title="worker">${esc(t.worker)}</span>` : '';
     const detail = isGate
-      ? `rejects ${t.gate_attempt||0}/${t.gate_max_attempts||0}`
+      ? `attempt ${t.gate_attempt||0}/${t.gate_max_attempts||0}`
       : `${t.status}${t.duration_s!=null?' '+fmtDur(t.duration_s):''}`;
     return `<li><button type="button" class="taskrow ${active} ${isGate?'gate-node':''}" onclick="loadTask('${id}')">
         <span class="dot ${t.status}"></span><b>${esc(id)}</b>${kind}
@@ -389,7 +389,7 @@ function renderTask() {
     `${esc(t.status)}` +
     (t.worker ? ` &middot; ${esc(t.worker)}` : '') +
     (t.model ? ` &middot; ${esc(t.model)}` : '') +
-    (isGate ? ` &middot; rejects ${t.gate_attempt||0}/${t.gate_max_attempts||0}` : '');
+    (isGate ? ` &middot; attempt ${t.gate_attempt||0}/${t.gate_max_attempts||0}` : '');
   const dl = document.getElementById('task-download');
   dl.textContent = isGate ? 'Download decision material' : 'Download files';
   dl.href = `/api/runs/${encodeURIComponent(state.run)}/tasks/${encodeURIComponent(t.id)}/` +
@@ -411,12 +411,12 @@ function renderTask() {
   ];
   if (isGate) {
     rows.push(['analyses', (t.gate_targets||[]).join(', ') || '-']);
-    rows.push(['rejections', `${t.gate_attempt||0} of ${t.gate_max_attempts||0} allowed`]);
+    rows.push(['attempt', `${t.gate_attempt||0} of ${t.gate_max_attempts||0}`]);
     rows.push(['verdict', t.gate_verdict || (t.status === 'succeeded' ? 'VALID' : '-')]);
   }
   let html = '<table>' + rows.map(([k,v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join('') + '</table>';
   if (isGate && t.gate_feedback)
-    html += `<p><b>last rejection</b><pre>${esc(t.gate_feedback)}</pre></p>`;
+    html += `<p><b>last gate feedback</b><pre>${esc(t.gate_feedback)}</pre></p>`;
   if (d.request && d.request.prompt)
     html += `<p><b>prompt</b><pre>${esc(d.request.prompt)}</pre></p>`;
   if (s.tool_calls && s.tool_calls.length)
