@@ -16,6 +16,7 @@ failure marks the job failed; teardown always runs.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,6 +51,15 @@ class Context:
     capabilities: dict = field(default_factory=dict)
     # A worker-side SecretStore (resolves names, never values, from the plan).
     secrets: Any = None
+    # OpenCode invocation details, so a provider can run a nested OpenCode
+    # (e.g. the git provider resolving merge conflicts).
+    opencode_bin: str | None = None
+    opencode_flags: frozenset = frozenset()
+    model: str | None = None
+    agent: str | None = None
+    auto: bool = True
+    timeout_s: float | None = None
+    default_timeout_s: float = 900.0
 
 
 @dataclass
@@ -227,6 +237,22 @@ class Environment:
                     prepared.resource.id,
                     exc_info=True,
                 )
+
+
+def emit_event(ctx: Context, event: dict) -> None:
+    """Append a synthetic event to the job's ``events.jsonl``.
+
+    Providers use this for traceability (e.g. the git provider records merge
+    conflicts and their resolution). The executor truncates the file at the
+    start of a job and appends the OpenCode stream to it, so both end up in the
+    same per-task event log shown in the dashboard.
+    """
+    try:
+        path = Path(ctx.job_dir) / "events.jsonl"
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except OSError:
+        logger.debug("could not write event %s", event, exc_info=True)
 
 
 def check_path_allowed(path: Path, ctx: Context, *, label: str = "path") -> None:

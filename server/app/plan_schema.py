@@ -259,10 +259,11 @@ Built-in providers:
   `${OTHER}`).
 - `secret` — inject a named secret from the worker store (`{name, as?, required?}`).
   The plan never carries the value.
-- `git` — `{repo, path, worktree?, ref?, branch?, branch_mode?, push_to?,
-  set_upstream?, force?, clean?, cache?, publish?, remote?}`. `ref` is the start
-  point, `branch` the target the task commits to; `publish` is
-  `none|commit|push`.
+- `git` — `{repo, path, worktree?, ref?, branch?, branch_mode?, merge?,
+  push_to?, set_upstream?, force?, clean?, cache?, publish?, remote?}`. `ref` is
+  the start point, `branch` the target the task commits to; `publish` is
+  `none|commit|push`. `merge` is a list of refs merged into `branch` during
+  prepare; a conflict is resolved by the worker itself (Opencode), not failed.
 - `path` — expose an existing folder: `{path, mode: ro|rw, visible?}`.
 
 Resource notes:

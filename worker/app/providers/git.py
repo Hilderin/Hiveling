@@ -21,6 +21,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .. import opencode_run
 from ..environment import (
     Context,
     EnvironmentError,
@@ -29,6 +30,7 @@ from ..environment import (
     Prepared,
     Resource,
     check_path_allowed,
+    emit_event,
     external_permissions,
 )
 
@@ -49,11 +51,24 @@ _ALLOWED = {
     "publish",
     "remote",
     "commit_message",
+    "merge",
 }
 _BRANCH_MODES = {"create", "reuse", "recreate"}
 _CLEAN_MODES = {"none", "git", "full"}
 _PUBLISH_MODES = {"none", "commit", "push"}
 _CONFIG_NAMES = ("opencode.json", "opencode.jsonc")
+
+# Generic prompt used when a `merge` produces conflicts: the worker resolves
+# them itself with a nested OpenCode run, so the plan stays simple.
+CONFLICT_PROMPT = (
+    "A git merge produced conflicts in this repository. Resolve every conflict "
+    "in the working tree so the merge is complete and correct:\n"
+    "1. Run `git status` and inspect each conflicted file.\n"
+    "2. Edit each file to combine both sides correctly and remove every "
+    "conflict marker (<<<<<<<, =======, >>>>>>>).\n"
+    "3. Run `git add` on the resolved files.\n"
+    "Do not change anything unrelated to the conflicts and do not commit."
+)
 
 
 def _git_env() -> dict:
@@ -109,6 +124,11 @@ class GitProvider:
             raise EnvironmentError(
                 f"git: 'publish' must be one of {sorted(_PUBLISH_MODES)}"
             )
+        merge = resource.options.get("merge")
+        if merge is not None and (
+            not isinstance(merge, list) or not all(isinstance(r, str) for r in merge)
+        ):
+            raise EnvironmentError("git: 'merge' must be a list of refs")
 
     # ----------------------------------------------------------------- helpers
     @staticmethod
@@ -175,6 +195,12 @@ class GitProvider:
             workdir = repo_path
             self._checkout(repo_path, branch, ref, branch_mode, clean, cache)
 
+        # Merge the requested refs into the branch. A conflict is resolved by a
+        # nested OpenCode run (see CONFLICT_PROMPT), not by failing the prepare.
+        start_sha = _run(["rev-parse", "HEAD"], workdir).stdout.strip()
+        merge_refs = [str(r) for r in (options.get("merge") or [])]
+        merge_state = self._merge_refs(workdir, merge_refs, ctx) if merge_refs else None
+
         config_root = workdir if (workdir / ".opencode").exists() or any(
             (workdir / name).exists() for name in _CONFIG_NAMES
         ) else None
@@ -193,8 +219,119 @@ class GitProvider:
                 "worktree": worktree,
                 "config_root": str(config_root) if config_root else None,
                 "under_location": under_location,
+                "start_sha": start_sha,
+                "merge": merge_state,
             },
         )
+
+    # ------------------------------------------------------------------- merge
+    @staticmethod
+    def _conflicts(repo: Path) -> tuple[list[str], list[str]]:
+        unmerged = [
+            line
+            for line in _run(["diff", "--name-only", "--diff-filter=U"], repo).stdout.split()
+            if line
+        ]
+        check = (
+            _run(["diff", "--check"], repo).stdout
+            + _run(["diff", "--cached", "--check"], repo).stdout
+        )
+        markers = [line for line in check.splitlines() if "conflict marker" in line]
+        return unmerged, markers
+
+    @staticmethod
+    def _merge_in_progress(repo: Path) -> bool:
+        return (
+            _run(["rev-parse", "--verify", "--quiet", "MERGE_HEAD"], repo).returncode
+            == 0
+        )
+
+    @staticmethod
+    def _resolve_ref(repo: Path, ref: str) -> str:
+        for candidate in (ref, f"origin/{ref}"):
+            if _run(["rev-parse", "--verify", "--quiet", candidate], repo).returncode == 0:
+                return candidate
+        raise EnvironmentError(f"git: merge ref not found: {ref}")
+
+    def _resolve_conflicts(self, repo: Path, ctx: Context) -> None:
+        if not ctx.opencode_bin:
+            raise EnvironmentError(
+                "git: cannot resolve merge conflicts: opencode binary not found"
+            )
+        standalone = "--standalone" in (ctx.opencode_flags or frozenset())
+        timeout = ctx.timeout_s or ctx.default_timeout_s or None
+        logger.info("git: resolving merge conflicts with opencode in %s", repo)
+        try:
+            result = opencode_run.run(
+                ctx.opencode_bin,
+                repo,
+                CONFLICT_PROMPT,
+                model=ctx.model,
+                agent=ctx.agent,
+                auto=ctx.auto,
+                standalone=standalone,
+                timeout_s=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise EnvironmentError(f"git: conflict resolution timed out: {exc}") from exc
+        logger.info("git: conflict resolution finished (exit=%s)", result.returncode)
+
+    def _merge_refs(self, repo: Path, refs: list[str], ctx: Context) -> dict:
+        conflicts: list[str] = []
+        commits: list[dict] = []
+        for ref in refs:
+            target = self._resolve_ref(repo, ref)
+            result = _git(["merge", "--no-commit", "--no-ff", target], repo, check=False)
+            unmerged, markers = self._conflicts(repo)
+            if unmerged or markers:
+                logger.info(
+                    "git: merge conflict on %s (%d file(s)), asking OpenCode",
+                    ref,
+                    len(unmerged) or len(markers),
+                )
+                emit_event(
+                    ctx,
+                    {
+                        "type": "hiveling.merge",
+                        "phase": "conflict",
+                        "ref": ref,
+                        "files": unmerged or markers,
+                    },
+                )
+                conflicts.extend(unmerged or markers)
+                self._resolve_conflicts(repo, ctx)
+                unmerged, markers = self._conflicts(repo)
+                if unmerged or markers:
+                    emit_event(
+                        ctx,
+                        {
+                            "type": "hiveling.merge",
+                            "phase": "unresolved",
+                            "ref": ref,
+                            "files": unmerged or markers,
+                        },
+                    )
+                    raise EnvironmentError(
+                        f"git: merge conflicts on '{ref}' could not be resolved: "
+                        f"{', '.join((unmerged or markers)[:20])}"
+                    )
+                emit_event(ctx, {"type": "hiveling.merge", "phase": "resolved", "ref": ref})
+            elif result.returncode != 0:
+                raise EnvironmentError(
+                    f"git: merge of '{ref}' failed: {result.stderr.strip()[-500:]}"
+                )
+
+            if self._merge_in_progress(repo):
+                commit = _git(["commit", "--no-edit", "-m", f"hiveling: merge {ref}"], repo)
+                if commit.returncode != 0:
+                    raise EnvironmentError(
+                        f"git: merge commit for '{ref}' failed: "
+                        f"{commit.stderr.strip()[-500:]}"
+                    )
+            commits.append(
+                {"ref": ref, "sha": _run(["rev-parse", "HEAD"], repo).stdout.strip()}
+            )
+        return {"refs": refs, "conflicts": sorted(set(conflicts)), "commits": commits}
 
     @staticmethod
     def _is_under(path: Path, root: Path) -> bool:
@@ -291,11 +428,16 @@ class GitProvider:
                 )
             committed = True
 
-        if publish == "commit" or not committed:
+        # Push when this run produced a commit, or when the branch already moved
+        # during prepare (an integration `merge` commits before the task runs).
+        start_sha = str(prepared.state.get("start_sha") or "")
+        head = _run(["rev-parse", "HEAD"], repo).stdout.strip()
+        moved = bool(start_sha and head and head != start_sha)
+
+        if publish == "commit" or (not committed and not moved):
             # Nothing to push, or push not requested.
-            sha = _run(["rev-parse", "HEAD"], repo).stdout.strip()
             return FinalizeResult(
-                commits=[self._commit_entry(repo, branch, sha, remote, False, options)]
+                commits=[self._commit_entry(repo, branch, head, remote, False, options)]
             )
 
         push_args = ["push"]

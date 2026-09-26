@@ -39,6 +39,7 @@ class Job:
     deleted: list[str] = field(default_factory=list)
     commits: list = field(default_factory=list)
     artifacts: list = field(default_factory=list)
+    merge: dict = field(default_factory=dict)
     cancel_requested: bool = False
     shutdown_requested: bool = False
     process: Any = None
@@ -71,6 +72,7 @@ class Job:
             "deleted": self.deleted,
             "commits": self.commits,
             "artifacts": self.artifacts,
+            "merge": self.merge,
         }
 
     def save(self) -> None:
@@ -141,6 +143,7 @@ class Registry:
             job.deleted = data.get("deleted") or []
             job.commits = data.get("commits") or []
             job.artifacts = data.get("artifacts") or []
+            job.merge = data.get("merge") or {}
             if job.status in ACTIVE_STATUSES:
                 job.status = "failed"
                 job.error = "worker restarted during the job"

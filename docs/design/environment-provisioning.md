@@ -403,9 +403,15 @@ Semantics:
 Conflicts and parallelism: each task commits to its own branch, and with
 `worktree: true` each also gets its own working tree, so two tasks never write
 the same tree. A task can consume a producer's branch as its `ref` (7.5).
-**Automated integration/merge is out of scope for v1** — conflict handling is
-deferred (see 17.1); a plan that needs integration will do it as a normal task
-once that is designed.
+
+**Integration (`merge: [refs]`).** A `git` resource can merge refs into
+`branch` during `prepare`, before the task's OpenCode run. A conflict does not
+fail the prepare: the worker resolves it with a nested OpenCode run using a
+generic built-in prompt (`worker/app/providers/git.py`), then commits one merge
+commit per ref. The result is published by the normal `finalize`. Traceability
+lives in the task's own log: synthetic `hiveling.merge` events in
+`events.jsonl` and a `merge` field in `status.json`/`run.json`. Only `merge`
+(no rebase), no configurable strategy or message.
 
 ### 8.2 `path`
 
@@ -976,8 +982,10 @@ Compatibility guarantees:
    priority order, each behind a `<!-- source: ... -->` marker. A repo
    `AGENTS.md` below the location is left to OpenCode discovery and is not
    duplicated (section 9.3).
-6. **Integration/merge is out of scope for v1.** No automated merge and no
-   multi-branch `merge:` option; conflict handling is explicitly deferred.
+6. **Integration/merge: `merge: [refs]` on the `git` provider.** Conflicts are
+   resolved by the worker with a nested OpenCode run (generic hardcoded
+   prompt), then committed. No rebase, no strategy/message options; the
+   resolution is traced in the task events and `status.json`.
 7. **History growth / GC is deferred** and tracked in `todo.md`, not part of
    this design.
 8. **`branch_mode` / `force` defaults: `create` + no force.** A task creates its
@@ -1016,8 +1024,8 @@ Compatibility guarantees:
 - **Config-ancestry check**: optionally fail `prepare` when an ancestor of the
   location dir contains OpenCode config, for strict isolation. Not in v1 — the
   machine baseline is accepted (17.1 item 13).
-- Git integration/merge, workspace GC / history retention, and the
-  plan-authoring skill are tracked in `todo.md`.
+- Workspace GC / history retention and the plan-authoring skill are tracked in
+  `todo.md`.
 
 ## 18. Appendix
 

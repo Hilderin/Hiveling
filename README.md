@@ -427,7 +427,7 @@ new ids append). Built-in providers:
 | `ephemeral` | — | A fresh, isolated working directory (the default behavior). |
 | `env` | `vars` | Inject environment variables (`${NAME}` expands the worker env). |
 | `secret` | `name`, `as?`, `required?` | Inject a secret resolved **on the worker** (never in the plan). |
-| `git` | `repo`, `path`, `worktree?`, `ref?`, `branch?`, `branch_mode?`, `push_to?`, `clean?`, `cache?`, `publish?`, `remote?`, `force?` | Clone/reset/checkout, optional per-task worktree, commit/push. |
+| `git` | `repo`, `path`, `worktree?`, `ref?`, `branch?`, `branch_mode?`, `merge?`, `push_to?`, `clean?`, `cache?`, `publish?`, `remote?`, `force?` | Clone/reset/checkout, optional per-task worktree, merge, commit/push. |
 | `path` | `path`, `mode` (`ro`/`rw`), `visible?` | Expose an existing folder. |
 | `command` | `prepare`, `finalize`, `shell?`, `env?`, `cwd?`, `timeout_s?` | **Opt-in** escape hatch: shell commands around the run. |
 
@@ -438,6 +438,31 @@ another task's branch, declare the same repo with
 `ref: "hiveling/{run}/<producer>"` and `depends_on: [<producer>]` — there is no
 cross-task substitution. `{run}` and `{task}` in option strings are resolved by
 the server.
+
+`merge: [refs]` merges the refs into `branch` during prepare, **before** the
+task's OpenCode run. A conflict does not fail the task: the worker resolves it
+itself with a nested OpenCode run (a generic built-in prompt), then commits a
+merge commit per ref. Traceability is in the task's own log: synthetic
+`hiveling.merge` events in `events.jsonl` (visible in the dashboard) plus a
+structured `merge` field in `status.json` / `run.json` / `get_task`. Example —
+an integration task that fans several branches in:
+
+```yaml
+- id: integrate
+  depends_on: [feature-a, feature-b]
+  prompt: "Run the test suite on the merged result."
+  resources:
+    - type: git
+      id: app
+      with:
+        repo: REPO
+        path: ~/.cache/hiveling/app.git
+        worktree: true
+        ref: main
+        branch: "hiveling/{run}/integrate"
+        merge: ["hiveling/{run}/feature-a", "hiveling/{run}/feature-b"]
+        publish: push
+```
 
 Absolute paths (`git.path`, `path.path`, `opencode` sources) must live under the
 worker's `path_roots`; relative paths resolve under the job workspace.
@@ -475,8 +500,10 @@ artifacts:
   git: true               # keep the commits/branches a git resource published
 ```
 
-Commits (branch, sha, remote, pushed) are recorded in the run state
-(`run.json`), printed by the CLI and returned by `get_task`.
+Commits (branch, sha, remote, pushed) and merge results (refs, conflicted
+files, merge commits) are recorded in the run state (`run.json`), printed by the
+CLI and returned by `get_task`; merge conflicts also appear as `hiveling.merge`
+lines in the task's events.
 
 ## Worker configuration
 

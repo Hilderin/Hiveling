@@ -256,10 +256,23 @@ def execute(job: Job, config: Config) -> None:
     events_path = job.dir / "events.jsonl"
     stderr_path = job.dir / "stderr.log"
     before_path = job.dir / "snapshot_before.json"
+    # Truncate the event log now. Providers may append synthetic events (e.g.
+    # merge conflicts) during prepare, before the OpenCode stream is appended.
+    try:
+        events_path.write_text("", encoding="utf-8")
+    except OSError:
+        pass
 
     # Provision the task's resources before doing anything else: a validation or
     # prepare failure must abort before OpenCode starts.
     capabilities = _capabilities(config)
+    try:
+        opencode_binary = resolve_binary(config.opencode_bin)
+        opencode_flags = _run_flags(opencode_binary)
+    except FileNotFoundError:
+        opencode_binary = None
+        opencode_flags = frozenset()
+    timeout_s = float(job.spec.get("timeout_s") or config.default_timeout_s)
     ctx = Context(
         workspace=workdir,
         job_dir=job.dir,
@@ -268,6 +281,13 @@ def execute(job: Job, config: Config) -> None:
         path_roots=list(capabilities.get("path_roots") or []),
         capabilities=capabilities,
         secrets=getattr(config, "secrets", None),
+        opencode_bin=opencode_binary,
+        opencode_flags=opencode_flags,
+        model=job.spec.get("model"),
+        agent=job.spec.get("agent"),
+        auto=bool(job.spec.get("auto", True)),
+        timeout_s=timeout_s,
+        default_timeout_s=config.default_timeout_s,
     )
     environment: Environment | None = None
     try:
@@ -282,6 +302,11 @@ def execute(job: Job, config: Config) -> None:
         except EnvironmentError as exc:
             _fail_before_start(job, f"environment error: {exc}")
             return
+        job.merge = {
+            prepared.resource.id: prepared.state["merge"]
+            for prepared in environment.prepared
+            if prepared.state.get("merge")
+        }
 
     # Inject the OpenCode runtime config (agents, skills, AGENTS.md, permissions)
     # at the location directory before OpenCode starts.
@@ -315,7 +340,6 @@ def execute(job: Job, config: Config) -> None:
     before_path.write_text(json.dumps(before, indent=2), encoding="utf-8")
 
     accumulator = _EventAccumulator()
-    timeout_s = float(job.spec.get("timeout_s") or config.default_timeout_s)
 
     job.status = "running"
     job.started_at = time.time()
@@ -352,7 +376,7 @@ def execute(job: Job, config: Config) -> None:
             # run in the worker's launch directory instead of its own.
             env["PWD"] = str(workdir)
 
-        with open(events_path, "w", encoding="utf-8") as events_file, open(
+        with open(events_path, "a", encoding="utf-8") as events_file, open(
             stderr_path, "w", encoding="utf-8"
         ) as stderr_file:
             process = subprocess.Popen(

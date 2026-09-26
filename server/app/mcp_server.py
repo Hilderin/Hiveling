@@ -339,6 +339,7 @@ def create_mcp_server(manager, config) -> MCPServer:
             "stderr": "",
             "commits": list(state.get("commits") or []),
             "artifacts": list(state.get("artifacts") or []),
+            "merge": dict(state.get("merge") or {}),
         }
         directory = history_dir_for(run, task_id)
         if directory and directory.is_dir():
@@ -348,6 +349,8 @@ def create_mcp_server(manager, config) -> MCPServer:
                 detail["commits"] = detail["status"]["commits"]
             if detail["status"].get("artifacts"):
                 detail["artifacts"] = detail["status"]["artifacts"]
+            if detail["status"].get("merge"):
+                detail["merge"] = detail["status"]["merge"]
             result_path = directory / "result.txt"
             detail["result"] = (
                 result_path.read_text(encoding="utf-8") if result_path.is_file() else ""

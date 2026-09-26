@@ -2,7 +2,6 @@
 
 ## Open
 
-- Git integration/merge between worker branches (conflict handling)
 - Goal mode / finish_check_prompt / checks
 - Versioned plan mutations
 - Add a task to a plan
@@ -12,6 +11,8 @@
 - Remote execution as a specific Windows user
 - Worker concurrency > 1
 - Agent, tokens and cost are not present in the history
+- Expose worker resources in the server and MCP (available/total RAM, CPU
+  count, CPU speed, etc.)
 
 ## Done
 
@@ -28,3 +29,5 @@
 - Worker workspace GC / history retention (`worker/gc.py`, retention flags)
 - Repo config override with deep merge + additive permission lists
 - Plan-authoring skill (`.opencode/skills/hiveling-plan/`)
+- Git integration/merge between worker branches: `merge: [refs]` resolved by
+  the worker's own OpenCode run

@@ -50,6 +50,7 @@ class TaskResult:
     error: str | None = None
     commits: list = field(default_factory=list)
     artifacts: list = field(default_factory=list)
+    merge: dict = field(default_factory=dict)
 
 
 class Orchestrator:
@@ -822,6 +823,7 @@ class Orchestrator:
             error=result.error,
             commits=result.commits,
             artifacts=result.artifacts,
+            merge=result.merge,
         )
         return result
 
@@ -946,6 +948,7 @@ class Orchestrator:
             error=status.get("error"),
             commits=list(status.get("commits") or []),
             artifacts=list(status.get("artifacts") or []),
+            merge=dict(status.get("merge") or {}),
         )
 
     def _poll(self, client: WorkerClient, job_id: str, task: Task) -> dict:
