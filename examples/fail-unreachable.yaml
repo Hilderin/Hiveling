@@ -1,9 +1,6 @@
 version: 1
 
-workers:
-  - name: ghost
-    host: 127.0.0.1
-    port: 9999
+# Requires an unreachable worker to be the only one configured in workers.yaml.
 
 defaults:
   model: opencode-go/deepseek-v4-flash

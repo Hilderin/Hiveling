@@ -40,7 +40,6 @@ class Plan:
     path: Path
     base_dir: Path
     version: int
-    workers: list[WorkerEndpoint]
     defaults: dict
     tasks: list[Task]
 
@@ -51,7 +50,8 @@ class Plan:
         raise PlanError(f"unknown task: {task_id}")
 
 
-def _parse_worker(entry, index: int) -> WorkerEndpoint:
+def parse_worker(entry, index: int) -> WorkerEndpoint:
+    """Parse one worker entry (a URL string or a host/port mapping)."""
     if isinstance(entry, str):
         return WorkerEndpoint(name=f"worker-{index}", url=entry)
     if not isinstance(entry, dict):
@@ -163,10 +163,11 @@ def load_plan(path: str | Path) -> Plan:
     if not isinstance(raw, dict):
         raise PlanError("the plan must be a YAML mapping")
 
-    workers_raw = raw.get("workers")
-    if not workers_raw:
-        raise PlanError("'workers' is required (list of URLs or host/port)")
-    workers = [_parse_worker(entry, i) for i, entry in enumerate(workers_raw)]
+    if "workers" in raw:
+        raise PlanError(
+            "'workers' is no longer configured in a plan; "
+            "declare workers in the workers.yaml file instead"
+        )
 
     tasks_raw = raw.get("tasks")
     if not tasks_raw:
@@ -180,7 +181,6 @@ def load_plan(path: str | Path) -> Plan:
         path=plan_path,
         base_dir=plan_path.parent,
         version=int(raw.get("version", 1)),
-        workers=workers,
         defaults=defaults,
         tasks=ordered,
     )

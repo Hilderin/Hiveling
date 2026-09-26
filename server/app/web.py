@@ -1,34 +1,43 @@
-"""FastAPI application for the server: JSON API + dashboard.
+"""FastAPI application for the server: JSON API + dashboard + MCP endpoint.
 
 It exposes the run history, live run state and lets the user cancel or retry
 runs, view/edit the plan behind a run, and start runs by pushing a plan YAML
-over HTTP. V1 has no authentication.
+over HTTP. The same operations are exposed to OpenCode over MCP (Streamable
+HTTP) on ``/mcp``. The JSON API has no authentication; the MCP endpoint
+supports an optional bearer token.
 """
 
 from __future__ import annotations
 
-import io
 import json
 import threading
-import time
-import uuid
-import zipfile
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel
 
 from .dashboard_html import DASHBOARD_HTML
+from .mcp_server import BearerAuthMiddleware, create_mcp_server
 from .orchestrator import Orchestrator
-from .plan import PlanError, WorkerEndpoint, load_plan
+from .plan import PlanError, load_plan
+from .plan_files import (
+    is_editable_plan,
+    persist_pushed_plan,
+    plan_summary,
+    resolve_known_plan,
+    write_plan,
+)
+from .readers import read_json, read_text, zip_dir
 from .runs import RunStore, new_run_id
-from .worker_client import WorkerClient, WorkerError
+from .workers import WorkerRegistry, probe_workers
 
 EVENTS_TAIL_LINES = 400
 WORKER_PROBE_TIMEOUT = 2.0
+TASK_TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "skipped"}
 
 
 @dataclass
@@ -37,6 +46,10 @@ class DashboardConfig:
     plans_dir: Path
     poll_interval: float = 2.0
     worker_wait_timeout: float = 1800.0
+    workers_file: Path | None = None
+    mcp_token: str | None = None
+    mcp_allowed_hosts: list[str] = field(default_factory=list)
+    mcp_allowed_origins: list[str] = field(default_factory=list)
 
     @property
     def history_dir(self) -> Path:
@@ -50,6 +63,10 @@ class DashboardConfig:
     def pushed_plans_dir(self) -> Path:
         return self.data_dir / "plans"
 
+    @property
+    def workers_path(self) -> Path:
+        return self.workers_file or (self.data_dir / "workers.yaml")
+
 
 class SavePlanRequest(BaseModel):
     content: str
@@ -61,6 +78,7 @@ class RunManager:
     def __init__(self, config: DashboardConfig):
         self.config = config
         self.store = RunStore(config.runs_dir)
+        self.workers = WorkerRegistry(config.workers_path)
         self._active: dict[str, dict] = {}
         self._lock = threading.Lock()
 
@@ -89,12 +107,48 @@ class RunManager:
             inputs_run_id=inputs_run_id,
             assume_deps_ok=assume_deps_ok,
             quiet=True,
+            workers_provider=self.workers.get,
+            task_cancel_provider=lambda task_id: self._task_cancel_requested(run_id, task_id),
         )
         thread = threading.Thread(target=orchestrator.run, daemon=True)
         with self._lock:
-            self._active[run_id] = {"event": cancel_event, "thread": thread}
+            self._active[run_id] = {
+                "event": cancel_event,
+                "thread": thread,
+                "task_cancels": {},
+            }
         thread.start()
         return run_id
+
+    def _task_cancel_requested(self, run_id: str, task_id: str) -> bool:
+        with self._lock:
+            entry = self._active.get(run_id)
+            if entry is None:
+                return False
+            event = entry["task_cancels"].get(task_id)
+            return event is not None and event.is_set()
+
+    def cancel_task(self, run_id: str, task_id: str) -> dict:
+        """Cancel one task of a run.
+
+        A running task is scheduled for cancellation (the orchestrator stops its
+        worker job at the next poll); a pending task is marked canceled so it is
+        never started. Dependent tasks are then skipped and the run continues.
+        """
+        run = self.store.read(run_id)
+        if run is None:
+            return {"ok": False, "reason": "run not found"}
+        state = next((t for t in run.get("tasks", []) if t.get("id") == task_id), None)
+        if state is None:
+            return {"ok": False, "reason": "task not found"}
+        if state.get("status") in TASK_TERMINAL_STATUSES:
+            return {"ok": False, "reason": f"task already {state['status']}"}
+        with self._lock:
+            entry = self._active.get(run_id)
+            if entry is not None:
+                entry.setdefault("task_cancels", {}).setdefault(task_id, threading.Event()).set()
+        self.store.update_task(run_id, task_id, status="canceled", error="canceled by user")
+        return {"ok": True, "task_id": task_id, "status": "canceled"}
 
     def cancel(self, run_id: str) -> bool:
         with self._lock:
@@ -130,95 +184,50 @@ class RunManager:
             self.store.write(run)
 
 
-def _read_json(path: Path) -> dict:
-    if not path.is_file():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+def _transport_security(config: DashboardConfig) -> TransportSecuritySettings | None:
+    """Build the MCP Host/Origin allowlist.
 
-
-def _read_text(path: Path, tail_lines: int | None = None) -> tuple[str, int]:
-    if not path.is_file():
-        return "", 0
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return "", 0
-    lines = text.splitlines()
-    total = len(lines)
-    if tail_lines is not None and total > tail_lines:
-        text = "\n".join(lines[-tail_lines:])
-    return text, total
-
-
-def _zip_dir(directory: Path) -> bytes:
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for path in sorted(directory.rglob("*")):
-            if path.is_file():
-                archive.write(path, path.relative_to(directory).as_posix())
-    return buffer.getvalue()
-
-
-def _safe_file_name(name: str) -> str:
-    cleaned = "".join(c if (c.isalnum() or c in "._-") else "-" for c in name).strip(".-")
-    return cleaned or "plan"
+    With no explicit host the SDK keeps its localhost-only default, which is
+    right for local development. As soon as a host or origin is configured we
+    add the localhost entries so local access keeps working.
+    """
+    hosts = list(config.mcp_allowed_hosts)
+    origins = list(config.mcp_allowed_origins)
+    if not hosts and not origins:
+        return None
+    for host in ("127.0.0.1", "localhost", "[::1]"):
+        for entry in (host, f"{host}:*"):
+            if entry not in hosts:
+                hosts.append(entry)
+    return TransportSecuritySettings(allowed_hosts=hosts, allowed_origins=origins)
 
 
 def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
+    mcp_server = create_mcp_server(manager, config)
+    mcp_app = mcp_server.streamable_http_app(
+        transport_security=_transport_security(config),
+    )
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         manager.reconcile()
-        yield
+        # A mounted sub-app's lifespan never runs, so the host owns the MCP
+        # session manager (without this the first /mcp request fails).
+        async with AsyncExitStack() as stack:
+            await stack.enter_async_context(mcp_server.session_manager.run())
+            yield
 
     app = FastAPI(title="Hiveling dashboard", version="1.0.0", lifespan=lifespan)
 
+    if config.mcp_token:
+        app.add_middleware(BearerAuthMiddleware, token=config.mcp_token)
+
     # ----------------------------------------------------------------- helpers
-    def plans_dir() -> Path:
-        return config.plans_dir.resolve()
-
-    def resolve_known_plan(name: str) -> Path:
-        candidate = (plans_dir() / name).resolve()
-        base = plans_dir()
-        if candidate != base and base not in candidate.parents:
-            raise HTTPException(status_code=400, detail="invalid plan path")
-        if candidate.suffix not in (".yaml", ".yml"):
-            raise HTTPException(status_code=400, detail="plan must be a .yaml/.yml file")
-        return candidate
-
-    def list_plan_files() -> list[Path]:
-        base = plans_dir()
-        if not base.exists():
-            return []
-        return sorted(p for p in base.rglob("*") if p.suffix in (".yaml", ".yml") and p.is_file())
-
-    def plan_summary(path: Path) -> dict:
+    def resolve_plan_name(name: str) -> Path:
         try:
-            plan = load_plan(path)
-            return {
-                "workers": [{"name": w.name, "url": w.url} for w in plan.workers],
-                "tasks": [
-                    {
-                        "id": t.id,
-                        "depends_on": t.depends_on,
-                        "inputs_from": t.inputs_from,
-                        "model": t.model,
-                    }
-                    for t in plan.tasks
-                ],
-                "error": None,
-            }
+            return resolve_known_plan(config.plans_dir, name)
         except PlanError as exc:
-            return {"workers": [], "tasks": [], "error": str(exc)}
-
-    def is_editable_plan(path: Path) -> bool:
-        resolved = path.resolve()
-        for base in (plans_dir(), config.data_dir.resolve()):
-            if resolved == base or base in resolved.parents:
-                return True
-        return False
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # ------------------------------------------------------------------- runs
     @app.get("/api/runs")
@@ -266,11 +275,11 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
 
         if plan_yaml:
             try:
-                plan_path = _persist_pushed_plan(config, name, plan_yaml)
+                plan_path = persist_pushed_plan(config.pushed_plans_dir, name, plan_yaml)
             except PlanError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         elif plan_name:
-            plan_path = resolve_known_plan(plan_name)
+            plan_path = resolve_plan_name(plan_name)
             if not plan_path.is_file():
                 raise HTTPException(status_code=404, detail="plan not found")
         else:
@@ -318,6 +327,15 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"run_id": new_id}
 
+    @app.post("/api/runs/{run_id}/tasks/{task_id}/cancel")
+    def api_task_cancel(run_id: str, task_id: str) -> dict:
+        result = manager.cancel_task(run_id, task_id)
+        if result.get("reason") == "run not found":
+            raise HTTPException(status_code=404, detail="run not found")
+        if result.get("reason") == "task not found":
+            raise HTTPException(status_code=404, detail="task not found")
+        return result
+
     # ------------------------------------------------------------ run's plan
     def run_plan_path(run_id: str) -> tuple[dict, Path]:
         run = manager.store.read(run_id)
@@ -326,7 +344,7 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
         path = Path(run["plan_path"])
         if not path.is_file():
             raise HTTPException(status_code=404, detail="plan file no longer exists")
-        if not is_editable_plan(path):
+        if not is_editable_plan(config.plans_dir, config.data_dir, path):
             raise HTTPException(status_code=403, detail="plan is not editable from the dashboard")
         return run, path
 
@@ -343,14 +361,10 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
     @app.put("/api/runs/{run_id}/plan")
     def api_run_plan_put(run_id: str, body: SavePlanRequest) -> dict:
         _, path = run_plan_path(run_id)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(body.content, encoding="utf-8")
         try:
-            load_plan(tmp)
+            write_plan(path, body.content)
         except PlanError as exc:
-            tmp.unlink(missing_ok=True)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        tmp.replace(path)
         return {"ok": True}
 
     # ------------------------------------------------------------------ tasks
@@ -374,14 +388,14 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
         detail: dict = {"task": state, "status": {}, "request": {}, "result": "",
                         "events": "", "event_lines": 0, "stderr": ""}
         if directory and directory.is_dir():
-            detail["status"] = _read_json(directory / "status.json")
-            detail["request"] = _read_json(directory / "request.json")
+            detail["status"] = read_json(directory / "status.json")
+            detail["request"] = read_json(directory / "request.json")
             result_path = directory / "result.txt"
             detail["result"] = result_path.read_text(encoding="utf-8") if result_path.is_file() else ""
-            events, total = _read_text(directory / "events.jsonl", EVENTS_TAIL_LINES)
+            events, total = read_text(directory / "events.jsonl", EVENTS_TAIL_LINES)
             detail["events"] = events
             detail["event_lines"] = total
-            stderr, _ = _read_text(directory / "stderr.log", EVENTS_TAIL_LINES)
+            stderr, _ = read_text(directory / "stderr.log", EVENTS_TAIL_LINES)
             detail["stderr"] = stderr
         return detail
 
@@ -397,7 +411,7 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
         if zip_path.is_file():
             data = zip_path.read_bytes()
         elif (directory / "files").is_dir():
-            data = _zip_dir(directory / "files")
+            data = zip_dir(directory / "files")
         else:
             raise HTTPException(status_code=404, detail="no files for this task")
         return Response(
@@ -407,72 +421,21 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
         )
 
     # ---------------------------------------------------------------- workers
-    def known_workers() -> list[dict]:
-        seen: dict[str, dict] = {}
-        paths = list(list_plan_files())
-        for summary in manager.store.list(limit=500):
-            run = manager.store.read(summary["run_id"])
-            if run and run.get("plan_path"):
-                candidate = Path(run["plan_path"])
-                if candidate.is_file():
-                    paths.append(candidate)
-        for path in paths:
-            try:
-                plan = load_plan(path)
-            except PlanError:
-                continue
-            for worker in plan.workers:
-                seen.setdefault(worker.url, {"name": worker.name, "url": worker.url})
-        return list(seen.values())
-
     @app.get("/api/workers")
     def api_workers() -> dict:
-        results = []
-        for worker in known_workers():
-            entry = {"name": worker["name"], "url": worker["url"],
-                     "reachable": False, "busy": None, "active_job": None, "opencode_bin": None}
-            client = WorkerClient(
-                WorkerEndpoint(name=worker["name"], url=worker["url"]),
-                timeout=WORKER_PROBE_TIMEOUT,
-            )
-            try:
-                health = client.health()
-                entry.update(
-                    reachable=True,
-                    busy=health.get("busy"),
-                    active_job=health.get("active_job"),
-                    opencode_bin=health.get("opencode_bin"),
-                )
-            except WorkerError:
-                pass
-            finally:
-                client.close()
-            results.append(entry)
-        return {"workers": results, "data_dir": str(config.data_dir)}
+        data = probe_workers(manager.workers, WORKER_PROBE_TIMEOUT)
+        data["data_dir"] = str(config.data_dir)
+        data["workers_file"] = str(config.workers_path)
+        return data
 
     # -------------------------------------------------------------- dashboard
     @app.get("/", response_class=HTMLResponse)
     def dashboard() -> str:
         return DASHBOARD_HTML
 
+    # ------------------------------------------------------------------- MCP
+    # Mounted last so every API/dashboard route above wins; the MCP endpoint is
+    # at /mcp. A mounted sub-app's lifespan never runs, hence the host lifespan.
+    app.mount("/", mcp_app)
+
     return app
-
-
-def _persist_pushed_plan(config: DashboardConfig, name: str | None, content: str) -> Path:
-    """Validate a pushed plan and store it under the data directory."""
-    directory = config.pushed_plans_dir
-    directory.mkdir(parents=True, exist_ok=True)
-    if name:
-        base = _safe_file_name(name)
-        if not base.endswith((".yaml", ".yml")):
-            base += ".yaml"
-    else:
-        base = f"pushed-{time.strftime('%Y-%m-%dT%H-%M-%S')}-{uuid.uuid4().hex[:4]}.yaml"
-    target = directory / base
-    target.write_text(content, encoding="utf-8")
-    try:
-        load_plan(target)
-    except PlanError:
-        target.unlink(missing_ok=True)
-        raise
-    return target

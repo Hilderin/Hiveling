@@ -4,11 +4,6 @@ version: 1
 # depends on it and must be skipped, the third has no dependency and should
 # run when --keep-going is used.
 
-workers:
-  - name: local
-    host: 127.0.0.1
-    port: 8787
-
 defaults:
   model: opencode-go/deepseek-v4.1-flash
   auto: true

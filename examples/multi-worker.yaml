@@ -1,12 +1,6 @@
 version: 1
 
-workers:
-  - name: w1
-    host: 127.0.0.1
-    port: 8787
-  - name: w2
-    host: 127.0.0.1
-    port: 8788
+# Multiple workers are declared in workers.yaml; V1 dispatches to the first free one.
 
 defaults:
   model: opencode-go/deepseek-v4.1-flash

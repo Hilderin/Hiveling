@@ -2,11 +2,7 @@ version: 1
 
 # edited via dashboard
 
-# Worker list. V1: the server dispatches to the first free worker.
-workers:
-  - name: local
-    host: 127.0.0.1
-    port: 8787
+# Workers come from workers.yaml (default .data/workers.yaml).
 
 defaults:
   model: opencode-go/deepseek-v4.1-flash
