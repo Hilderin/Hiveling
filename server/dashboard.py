@@ -46,6 +46,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="max time (s) to wait for a free worker",
     )
     parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=None,
+        help="max concurrent tasks; default: the plan's max_parallel, else one per free worker",
+    )
+    parser.add_argument(
         "--log-dir",
         default=os.environ.get("HIVELING_LOG_DIR"),
         help="directory for the rotating server log (default: <data-dir>/logs)",
@@ -104,6 +110,7 @@ def main(argv: list[str] | None = None) -> None:
         plans_dir=plans_dir,
         poll_interval=args.poll_interval,
         worker_wait_timeout=args.worker_wait,
+        max_parallel=args.max_parallel,
         workers_file=workers_file,
         heartbeat_s=args.heartbeat,
         mcp_token=args.mcp_token,

@@ -3,7 +3,6 @@
 ## Open
 
 - Goal mode / finish_check_prompt / checks
-- Parallel DAG execution
 - Worker capabilities / task requirements
 - Versioned plan mutations
 - Reproducible OpenCode runtime config
@@ -19,3 +18,5 @@
 ## Done
 
 - Cancel a task
+- Parallel DAG execution (dependencies + available workers; fail fast waits
+  for in-flight tasks)

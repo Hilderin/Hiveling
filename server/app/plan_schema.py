@@ -30,6 +30,10 @@ class DefaultsInput(BaseModel):
     download: DownloadMode | None = Field(default=None, description="modified (default) | all | none.")
     env: dict[str, str] | None = Field(default=None, description="Extra environment variables.")
     files: list[str] | None = Field(default=None, description="Input paths/globs relative to the plan.")
+    max_parallel: int | None = Field(
+        default=None,
+        description="Max tasks running at once; 0/unset means one per free worker.",
+    )
 
 
 class TaskInput(BaseModel):
@@ -102,6 +106,8 @@ Top-level keys:
 - `defaults` (optional mapping), applied to every task unless overridden:
   - `model`, `agent`, `auto` (bool), `timeout_s` (number), `variant`,
     `download` (`modified` | `all` | `none`), `env` (map), `files` (list)
+  - `max_parallel` (int): max tasks running at once; 0/unset means one per free
+    worker
 - `tasks` (required, list). Each task:
   - `id` (required, unique)
   - `prompt` (string) or `prompt_file` (path relative to the plan): required
@@ -117,11 +123,14 @@ Notes:
 
 - `depends_on` and `inputs_from` both imply ordering. Use `inputs_from` to pass
   files from one task to the next; working directories are otherwise independent.
-- Tasks are topologically sorted by the server; declare them in a sensible order.
+- Tasks are topologically sorted by the server; independent tasks run in
+  parallel, one per free worker.
 - `download: modified` (default) downloads files the task changed/added,
   `all` downloads the whole working directory, `none` downloads nothing.
-- A run stops at the first failed task (fail fast); `resume_run` re-arms it and
-  re-runs the failed/skipped tasks after an adjustment.
+- A run stops at the first failed task (fail fast): no new task is started, but
+  the tasks already running are allowed to finish before the run is finalized.
+  `resume_run` re-arms it and re-runs the failed/skipped tasks after an
+  adjustment.
 """
 
 PLAN_EXAMPLE = """\

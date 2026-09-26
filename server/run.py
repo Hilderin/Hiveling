@@ -9,8 +9,10 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import socket
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -57,6 +59,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=1800.0,
         help="max time (s) to wait for a free worker (default: 1800)",
+    )
+    parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=None,
+        help="max concurrent tasks; default: the plan's max_parallel, else one per free worker",
     )
     parser.add_argument(
         "--only",
@@ -109,16 +117,28 @@ def main(argv: list[str] | None = None) -> int:
     console.print(f"[dim]run id: {run_id}[/]")
     log_startup(plan=args.plan, run_id=run_id, workers_file=args.workers_file, log_file=log_path)
 
+    # Ctrl+C cancels the run (jobs stop, then in-flight tasks are drained)
+    # instead of abruptly killing the worker threads mid-request.
+    cancel_event = threading.Event()
+
+    def _sigint(_signum, _frame) -> None:
+        console.print("[yellow]interrupted: canceling run on the next poll...[/]")
+        cancel_event.set()
+
+    signal.signal(signal.SIGINT, _sigint)
+
     orchestrator = Orchestrator(
         plan,
         history_dir=Path(args.history_dir).expanduser().resolve(),
         poll_interval=poll_interval,
         worker_wait_timeout=args.worker_wait,
+        max_parallel=args.max_parallel,
         console=console,
         dry_run=args.dry_run,
         only=args.only,
         run_store=None if args.dry_run else run_store,
         run_id=run_id,
+        cancel_event=cancel_event,
         workers_provider=registry.get,
         plan_path=snapshot,
         plan_base_dir=plan.base_dir,

@@ -1,6 +1,7 @@
 version: 1
 
-# Multiple workers are declared in workers.yaml; V1 dispatches to the first free one.
+# Multiple workers are declared in workers.yaml; independent tasks run in
+# parallel, one per free worker.
 
 defaults:
   model: opencode-go/deepseek-v4.1-flash

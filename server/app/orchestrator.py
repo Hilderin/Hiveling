@@ -1,4 +1,9 @@
-"""Orchestrator: sequential dispatch of tasks to the first free worker.
+"""Orchestrator: parallel DAG dispatch of tasks to the available workers.
+
+Tasks whose dependencies have succeeded are dispatched concurrently, one per
+free worker. A failed task stops new dispatches (fail fast) but never kills the
+tasks already in flight: the run stays ``running`` until they finish, so
+``wait_for_run`` only reports a terminal run once every in-flight task is done.
 
 The engine is reused by the CLI (``server/run.py``) and by the dashboard
 (``server/dashboard.py``). When a ``RunStore`` is provided, it records the run
@@ -10,6 +15,7 @@ from __future__ import annotations
 import glob
 import io
 import logging
+import queue
 import threading
 import time
 import uuid
@@ -29,7 +35,6 @@ from .worker_client import WorkerBusy, WorkerClient, WorkerError
 logger = logging.getLogger("hiveling.server.orchestrator")
 
 TERMINAL_STATUSES = {"succeeded", "failed", "canceled"}
-TASK_TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "skipped"}
 
 
 @dataclass
@@ -56,6 +61,7 @@ class Orchestrator:
         console: Console | None = None,
         dry_run: bool = False,
         only: list[str] | None = None,
+        max_parallel: int | None = None,
         run_store: RunStore | None = None,
         run_id: str | None = None,
         cancel_event: threading.Event | None = None,
@@ -81,6 +87,11 @@ class Orchestrator:
         self.console = console or Console()
         self.dry_run = dry_run
         self.only = set(only) if only else None
+        # 0 (or unset) means "as many tasks as there are free workers"; an
+        # explicit value also caps the number of concurrent tasks.
+        if max_parallel is None:
+            max_parallel = plan.defaults.get("max_parallel")
+        self.max_parallel = max(0, int(max_parallel or 0))
         self.run_store = run_store
         self.run_id = run_id or new_run_id()
         self.cancel_event = cancel_event
@@ -171,83 +182,94 @@ class Orchestrator:
 
         results: dict[str, str] = dict(self.initial_results)
         canceled = False
+        # ``halt`` stops dispatching new tasks (fail fast / cancel) but the tasks
+        # already running are always awaited before the run is finalized.
+        halt = False
+        done: queue.Queue = queue.Queue()
+        running: dict[str, tuple[WorkerClient | None, threading.Thread]] = {}
+        inbox: list = []
+        worker_deadline: float | None = None
         try:
             self._print_workers()
-            # The task list is re-derived from the (possibly edited) plan at the
-            # top of every iteration, so live edits apply between tasks.
+            # The task list is re-derived from the (possibly edited) plan on
+            # every pass, so live edits apply between dispatches.
             while True:
                 self._refresh_plan()
-                tasks = [
-                    t for t in self.plan.tasks if self.only is None or t.id in self.only
-                ]
-                task = next((t for t in tasks if t.id not in results), None)
-                if task is None:
-                    break
+                tasks = self._plan_tasks()
 
-                if self._is_canceled():
-                    canceled = True
-                    self._cancel_remaining(tasks, results)
-                    logger.warning("run %s: canceled by user", self.run_id)
-                    break
-
-                if self._task_is_canceled(task.id):
-                    self._log(f"[yellow]canceled[/] {task.id} [dim](canceled while pending)[/]")
-                    logger.info("run %s: task %s canceled while pending", self.run_id, task.id)
-                    results[task.id] = "canceled"
-                    self._store_task(task.id, status="canceled", error="canceled by user")
-                    continue
-
-                failed_deps: list[str] = []
-                if not self.assume_deps_ok:
-                    dependencies = list(dict.fromkeys(list(task.depends_on) + list(task.inputs_from)))
-                    failed_deps = [
-                        dep for dep in dependencies if results.get(dep) != "succeeded"
-                    ]
-                if failed_deps:
-                    self._log(
-                        f"[yellow]skip[/] {task.id} [dim](unsatisfied dependencies: "
-                        f"{', '.join(failed_deps)})[/]"
-                    )
-                    logger.info(
-                        "run %s: task %s skipped (unsatisfied deps: %s)",
-                        self.run_id,
-                        task.id,
-                        ", ".join(failed_deps),
-                    )
-                    results[task.id] = "skipped"
-                    self._store_task(
-                        task.id,
-                        status="skipped",
-                        skip_reason="dependency",
-                        error=f"unsatisfied dependencies: {', '.join(failed_deps)}",
-                    )
-                    continue
-
-                result = self._run_task(task)
-                results[task.id] = result.status
-                logger.info("run %s: task %s -> %s", self.run_id, task.id, result.status)
-
-                if result.status == "canceled" and self._is_canceled():
-                    # The run was canceled while this task was running.
-                    canceled = True
-                    self._cancel_remaining(tasks, results)
-                    break
-                if result.status == "failed":
-                    # Fail fast: a failure always needs an orchestrator to
-                    # analyze and adjust before anything else runs.
+                # Collect the tasks that finished since the last pass. Only
+                # this loop mutates ``results``/``running``, so no lock is
+                # needed there.
+                events = inbox
+                inbox = []
+                while True:
+                    try:
+                        events.append(done.get_nowait())
+                    except queue.Empty:
+                        break
+                if events and self._handle_events(events, results, running):
+                    # A freshly failed task fails the run fast, but in-flight
+                    # tasks keep running to completion.
                     self._log("[red]task failed, stopping run[/]")
                     logger.warning(
-                        "run %s: task %s failed, stopping run", self.run_id, task.id
+                        "run %s: task failed, stopping run", self.run_id
                     )
-                    self._skip_remaining(
-                        tasks,
-                        results,
-                        reason="run_stopped",
-                        message=f"run stopped after {task.id} failed",
+                    halt = True
+
+                if self._is_canceled() and not canceled:
+                    canceled = True
+                    halt = True
+                    logger.warning("run %s: canceled by user", self.run_id)
+
+                capacity_blocked = False
+                if not halt:
+                    _, capacity_blocked = self._dispatch_ready(
+                        tasks, results, running, done
                     )
+
+                if halt and not running:
+                    if canceled:
+                        self._cancel_remaining(tasks, results, running)
+                    else:
+                        self._skip_remaining(
+                            tasks,
+                            results,
+                            running,
+                            reason="run_stopped",
+                            message="run stopped after a task failed",
+                        )
                     break
-                # A task canceled with cancel_task does not stop the run.
+                if not halt and not running and not self._has_pending(tasks, results):
+                    break
+
+                # No free worker while ready tasks wait: fail them once the
+                # configured wait elapses (as the sequential engine did).
+                if not running:
+                    if capacity_blocked:
+                        if worker_deadline is None:
+                            self._log("[yellow]no free worker available, waiting...[/]")
+                            worker_deadline = time.time() + self.worker_wait_timeout
+                        elif time.time() > worker_deadline:
+                            self._fail_no_worker(tasks, results, running)
+                            halt = True
+                            worker_deadline = None
+                    else:
+                        worker_deadline = None
+                else:
+                    worker_deadline = None
+
+                # Block until a task finishes (or poll), so completions wake us
+                # immediately and configuration changes are noticed regularly.
+                try:
+                    inbox.append(done.get(timeout=self.poll_interval))
+                except queue.Empty:
+                    pass
         finally:
+            # Let every in-flight task finish before tearing the clients down;
+            # this is what keeps the run "running" (and wait_for_run blocked)
+            # until the last worker job is drained.
+            for _, thread in list(running.values()):
+                thread.join()
             self._close_clients()
 
         if canceled:
@@ -295,45 +317,57 @@ class Orchestrator:
 
         New tasks are appended as pending; pending tasks that disappeared from
         the plan are marked canceled. Terminal/running tasks are never touched.
+        The whole read-modify-write runs under the store lock so it cannot lose
+        a concurrent task update from a worker thread.
         """
-        run = self.run_store.read(self.run_id)
-        if run is None:
-            return [], []
         only = sorted(self.only) if self.only else None
         new_states = {state["id"]: state for state in build_task_states(plan, only)}
-        existing = {task.get("id") for task in run.get("tasks", [])}
-
         added: list[str] = []
-        for task_id, state in new_states.items():
-            if task_id not in existing:
-                run["tasks"].append(state)
-                added.append(task_id)
-
         removed: list[str] = []
-        for task in run.get("tasks", []):
-            if task.get("id") not in new_states and task.get("status") == "pending":
-                task["status"] = "skipped"
-                task["skip_reason"] = "removed"
-                task["error"] = "removed from plan"
-                removed.append(task["id"])
 
+        def reconcile(run: dict) -> None:
+            existing = {task.get("id") for task in run.get("tasks", [])}
+            for task_id, state in new_states.items():
+                if task_id not in existing:
+                    run["tasks"].append(state)
+                    added.append(task_id)
+            for task in run.get("tasks", []):
+                if task.get("id") not in new_states and task.get("status") == "pending":
+                    task["status"] = "skipped"
+                    task["skip_reason"] = "removed"
+                    task["error"] = "removed from plan"
+                    removed.append(task["id"])
+
+        run = self.run_store.update_from(self.run_id, reconcile)
+        if run is None:
+            return [], []
         if added or removed:
-            self.run_store.write(run)
             self._touch()
         return added, removed
 
-    def _cancel_remaining(self, tasks: list[Task], results: dict[str, str]) -> None:
+    def _cancel_remaining(
+        self,
+        tasks: list[Task],
+        results: dict[str, str],
+        running: dict[str, tuple[WorkerClient | None, threading.Thread]],
+    ) -> None:
         for remaining in tasks:
-            if remaining.id in results:
+            if remaining.id in results or remaining.id in running:
                 continue
             results[remaining.id] = "canceled"
             self._store_task(remaining.id, status="canceled", error="canceled by user")
 
     def _skip_remaining(
-        self, tasks: list[Task], results: dict[str, str], *, reason: str, message: str
+        self,
+        tasks: list[Task],
+        results: dict[str, str],
+        running: dict[str, tuple[WorkerClient | None, threading.Thread]],
+        *,
+        reason: str,
+        message: str,
     ) -> None:
         for remaining in tasks:
-            if remaining.id in results:
+            if remaining.id in results or remaining.id in running:
                 continue
             results[remaining.id] = "skipped"
             self._store_task(
@@ -357,6 +391,225 @@ class Orchestrator:
             return "failed"
         return "succeeded"
 
+    # --------------------------------------------------------------- scheduler
+    def _plan_tasks(self) -> list[Task]:
+        """The plan's tasks, honoring ``only``."""
+        return [
+            task for task in self.plan.tasks if self.only is None or task.id in self.only
+        ]
+
+    @staticmethod
+    def _has_pending(tasks: list[Task], results: dict[str, str]) -> bool:
+        return any(task.id not in results for task in tasks)
+
+    @staticmethod
+    def _dependencies(task: Task) -> list[str]:
+        return list(dict.fromkeys(list(task.depends_on) + list(task.inputs_from)))
+
+    def _unsatisfied(
+        self, task: Task, results: dict[str, str], known: set[str]
+    ) -> list[str]:
+        """Dependencies that can never succeed (failed, canceled or unknown)."""
+        bad: list[str] = []
+        for dep in self._dependencies(task):
+            if dep in results:
+                if results[dep] != "succeeded":
+                    bad.append(dep)
+            elif dep not in known:
+                bad.append(dep)
+        return bad
+
+    def _deps_pending(self, task: Task, results: dict[str, str]) -> bool:
+        return any(dep not in results for dep in self._dependencies(task))
+
+    def _handle_events(
+        self,
+        events: list,
+        results: dict[str, str],
+        running: dict[str, tuple[WorkerClient | None, threading.Thread]],
+    ) -> bool:
+        """Apply finished-task events. Returns True when a task freshly failed."""
+        new_failure = False
+        for kind, task_id, client, result in events:
+            running.pop(task_id, None)
+            if kind == "busy":
+                name = client.endpoint.name if client is not None else "worker"
+                self._log(f"[yellow]{name} busy[/], looking for another worker")
+                continue
+            self._record_result(result)
+            results[task_id] = result.status
+            logger.info("run %s: task %s -> %s", self.run_id, task_id, result.status)
+            if result.status == "failed":
+                new_failure = True
+        return new_failure
+
+    def _dispatch_ready(
+        self,
+        tasks: list[Task],
+        results: dict[str, str],
+        running: dict[str, tuple[WorkerClient | None, threading.Thread]],
+        done: queue.Queue,
+    ) -> tuple[bool, bool]:
+        """Start every ready task that fits on a free worker.
+
+        Returns ``(dispatched, capacity_blocked)``; the latter is True when a
+        ready task had to wait because no worker (or no parallelism slot) was
+        available.
+        """
+        dispatched = False
+        capacity_blocked = False
+        known = {task.id for task in tasks} | set(results)
+        available: list[WorkerClient] | None = None
+
+        for task in tasks:
+            if task.id in results or task.id in running:
+                continue
+
+            if self._task_is_canceled(task.id):
+                self._log(
+                    f"[yellow]canceled[/] {task.id} [dim](canceled while pending)[/]"
+                )
+                logger.info(
+                    "run %s: task %s canceled while pending", self.run_id, task.id
+                )
+                results[task.id] = "canceled"
+                self._store_task(task.id, status="canceled", error="canceled by user")
+                continue
+
+            if not self.assume_deps_ok:
+                bad = self._unsatisfied(task, results, known)
+                if bad:
+                    self._log(
+                        f"[yellow]skip[/] {task.id} [dim](unsatisfied dependencies: "
+                        f"{', '.join(bad)})[/]"
+                    )
+                    logger.info(
+                        "run %s: task %s skipped (unsatisfied deps: %s)",
+                        self.run_id,
+                        task.id,
+                        ", ".join(bad),
+                    )
+                    results[task.id] = "skipped"
+                    self._store_task(
+                        task.id,
+                        status="skipped",
+                        skip_reason="dependency",
+                        error=f"unsatisfied dependencies: {', '.join(bad)}",
+                    )
+                    continue
+                if self._deps_pending(task, results):
+                    continue  # dependencies not finished yet
+
+            # Reattaching to a job left running by a previous server process
+            # bypasses worker selection: it belongs to a specific worker.
+            if task.id in self.resume_jobs:
+                self._start_task(task, None, running, done)
+                dispatched = True
+                continue
+
+            if self.max_parallel and len(running) >= self.max_parallel:
+                capacity_blocked = True
+                continue
+            if available is None:
+                available = self._available_clients(running)
+            if not available:
+                capacity_blocked = True
+                continue
+
+            client = available[self._rr % len(available)]
+            self._rr += 1
+            available.remove(client)
+            self._start_task(task, client, running, done)
+            dispatched = True
+
+        return dispatched, capacity_blocked
+
+    def _fail_no_worker(
+        self,
+        tasks: list[Task],
+        results: dict[str, str],
+        running: dict[str, tuple[WorkerClient | None, threading.Thread]],
+    ) -> None:
+        """Fail the ready tasks that could not get a worker in time."""
+        known = {task.id for task in tasks} | set(results)
+        failed = 0
+        for task in tasks:
+            if task.id in results or task.id in running:
+                continue
+            if not self.assume_deps_ok:
+                if self._unsatisfied(task, results, known) or self._deps_pending(
+                    task, results
+                ):
+                    continue
+            results[task.id] = "failed"
+            self._store_task(task.id, status="failed", error="no worker available")
+            failed += 1
+        if failed:
+            logger.warning(
+                "run %s: %d task(s) failed: no worker available", self.run_id, failed
+            )
+
+    def _start_task(
+        self,
+        task: Task,
+        client: WorkerClient | None,
+        running: dict[str, tuple[WorkerClient | None, threading.Thread]],
+        done: queue.Queue,
+    ) -> None:
+        thread = threading.Thread(
+            target=self._task_main,
+            args=(task, client, done),
+            daemon=True,
+            name=f"task-{self.run_id}-{task.id}",
+        )
+        running[task.id] = (client, thread)
+        thread.start()
+
+    def _task_main(
+        self,
+        task: Task,
+        client: WorkerClient | None,
+        done: queue.Queue,
+    ) -> None:
+        """Worker-thread body: run one task and report back through ``done``."""
+        try:
+            resume = self.resume_jobs.get(task.id)
+            if resume is not None:
+                result = self._adopt_job(task, resume)
+            else:
+                result = self._execute_on(client, task)
+        except WorkerBusy:
+            done.put(("busy", task.id, client, None))
+            return
+        except PlanError as exc:
+            self._log(f"[red]plan error:[/] {exc}")
+            result = TaskResult(
+                task.id,
+                "failed",
+                worker=client.endpoint.name if client else None,
+                worker_url=client.base_url if client else None,
+                error=str(exc),
+            )
+        except WorkerError as exc:
+            self._log(f"[red]worker error:[/] {exc}")
+            result = TaskResult(
+                task.id,
+                "failed",
+                worker=client.endpoint.name if client else None,
+                worker_url=client.base_url if client else None,
+                error=str(exc),
+            )
+        except Exception as exc:  # a dead thread would hang the run forever
+            logger.exception("run %s: task %s crashed", self.run_id, task.id)
+            result = TaskResult(
+                task.id,
+                "failed",
+                worker=client.endpoint.name if client else None,
+                worker_url=client.base_url if client else None,
+                error=f"orchestrator error: {exc}",
+            )
+        done.put(("result", task.id, client, result))
+
     # ----------------------------------------------------------------- workers
     def _current_workers(self) -> list[WorkerEndpoint]:
         """Workers from the provider (live file) or the static list."""
@@ -367,20 +620,23 @@ class Orchestrator:
                 return self.workers
         return self.workers
 
-    def _sync_clients(self) -> list[WorkerClient]:
+    def _sync_clients(self, keep: set[str] | None = None) -> list[WorkerClient]:
         """Refresh the client pool from the current worker list.
 
         Called before each dispatch and on every wait iteration, so a worker
-        added to workers.yaml while a run is in flight is picked up.
+        added to workers.yaml while a run is in flight is picked up. Clients in
+        ``keep`` (workers with an in-flight task) are never closed, even if the
+        worker disappeared from the file, so their task can finish.
         """
         workers = {w.url: w for w in self._current_workers()}
         for url in list(self._clients):
-            if url not in workers:
-                try:
-                    self._clients[url].close()
-                except Exception:
-                    pass
-                del self._clients[url]
+            if url in workers or (keep and url in keep):
+                continue
+            try:
+                self._clients[url].close()
+            except Exception:
+                pass
+            del self._clients[url]
         for url, endpoint in workers.items():
             if url not in self._clients:
                 self._clients[url] = WorkerClient(endpoint)
@@ -422,51 +678,23 @@ class Orchestrator:
                 free.append(client)
         return free
 
-    def _wait_for_worker(self, task: Task) -> WorkerClient | None:
-        deadline = time.time() + self.worker_wait_timeout
-        announced = False
-        while time.time() < deadline:
-            if self._is_canceled() or self._task_is_canceled(task.id):
-                return None
-            free = self._free_clients(self._sync_clients())
-            if free:
-                client = free[self._rr % len(free)]
-                self._rr += 1
-                return client
-            if not announced:
-                self._log("[yellow]no free worker available, waiting...[/]")
-                announced = True
-            time.sleep(self.poll_interval)
-        return None
+    def _available_clients(
+        self, running: dict[str, tuple[WorkerClient | None, threading.Thread]]
+    ) -> list[WorkerClient]:
+        """Reachable workers that are neither reserved nor busy.
+
+        A worker is reserved as soon as a task of this run is dispatched to it;
+        that reservation is what keeps two tasks off the same worker even before
+        its ``/health`` reports ``busy``.
+        """
+        reserved = {
+            client.base_url for client, _ in running.values() if client is not None
+        }
+        return self._free_clients(
+            [c for c in self._sync_clients(keep=reserved) if c.base_url not in reserved]
+        )
 
     # ------------------------------------------------------------------ tasks
-    def _run_task(self, task: Task) -> TaskResult:
-        resume = self.resume_jobs.get(task.id)
-        if resume:
-            return self._adopt_job(task, resume)
-        while True:
-            client = self._wait_for_worker(task)
-            if client is None:
-                canceled = self._is_canceled() or self._task_is_canceled(task.id)
-                return self._record_result(
-                    TaskResult(task.id, "canceled" if canceled else "failed",
-                               error="canceled by user" if canceled else "no worker available")
-                )
-            try:
-                result = self._execute_on(client, task)
-            except WorkerBusy:
-                self._log(f"[yellow]{client.endpoint.name} busy[/], looking for another worker")
-                continue
-            except PlanError as exc:
-                self._log(f"[red]plan error:[/] {exc}")
-                result = TaskResult(task.id, "failed", worker=client.endpoint.name,
-                                    worker_url=client.base_url, error=str(exc))
-            except WorkerError as exc:
-                self._log(f"[red]worker error:[/] {exc}")
-                result = TaskResult(task.id, "failed", worker=client.endpoint.name,
-                                    worker_url=client.base_url, error=str(exc))
-            return self._record_result(result)
-
     def _adopt_job(self, task: Task, job: dict) -> TaskResult:
         """Reattach to a job left running by a previous server process."""
         url = job.get("worker_url")
@@ -474,19 +702,20 @@ class Orchestrator:
         name = job.get("worker") or url or "worker"
         if not url or not job_id:
             logger.error("run %s: task %s cannot resume (missing worker/job id)", self.run_id, task.id)
-            return self._record_result(
-                TaskResult(task.id, "failed", error="cannot resume: missing worker/job id")
-            )
+            return TaskResult(task.id, "failed", error="cannot resume: missing worker/job id")
         logger.info("run %s: task %s reattaching to %s job %s", self.run_id, task.id, name, job_id)
         self._log(f"[bold cyan]{task.id}[/] reattaching to [bold]{name}[/] [dim]({job_id})[/]")
         client = WorkerClient(WorkerEndpoint(name=name, url=url))
-        self._clients[url] = client
         try:
-            result = self._finish_job(client, task, job_id, request={})
+            return self._finish_job(client, task, job_id, request={})
         except WorkerError as exc:
-            result = TaskResult(task.id, "failed", worker=name, worker_url=url,
-                                job_id=job_id, error=f"resume failed: {exc}")
-        return self._record_result(result)
+            return TaskResult(task.id, "failed", worker=name, worker_url=url,
+                              job_id=job_id, error=f"resume failed: {exc}")
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
 
     def _record_result(self, result: TaskResult) -> TaskResult:
         self._store_task(
@@ -521,7 +750,10 @@ class Orchestrator:
         spec = {k: v for k, v in request.items() if v not in (None, {})}
         spec["files"] = []
 
-        inputs = self._resolve_inputs(task)
+        # Snapshot the base_dir once: a live plan edit must not change where
+        # this already-running task resolves its inputs.
+        base_dir = self.plan.base_dir
+        inputs = self._resolve_inputs(task, base_dir)
 
         client.create_job(spec)  # raises WorkerBusy when busy
         self._store_task(task.id, status="running", worker=client.endpoint.name,
@@ -670,15 +902,20 @@ class Orchestrator:
             time.sleep(self.poll_interval)
 
     # ------------------------------------------------------------------ files
-    def _resolve_inputs(self, task: Task) -> list[tuple[str, Path]]:
+    def _resolve_inputs(
+        self, task: Task, base_dir: Path | None = None
+    ) -> list[tuple[str, Path]]:
         """Resolve ``files`` patterns and ``inputs_from`` outputs.
 
-        Returns a list of ``(name_in_zip, source_path)``.
+        Returns a list of ``(name_in_zip, source_path)``. ``base_dir`` is snap­
+        shot at dispatch time so a live plan edit cannot change where an already
+        running task reads its inputs.
         """
+        base = base_dir if base_dir is not None else self.plan.base_dir
         pairs: dict[str, Path] = {}  # arcname -> source (dedup, last one wins)
 
         for spec in task.files:
-            matches = glob.glob(str(self.plan.base_dir / spec), recursive=True)
+            matches = glob.glob(str(base / spec), recursive=True)
             if not matches:
                 raise PlanError(f"task '{task.id}': file not found: {spec}")
             for match in matches:
@@ -686,9 +923,9 @@ class Orchestrator:
                 if path.is_dir():
                     for child in path.rglob("*"):
                         if child.is_file():
-                            pairs[self._arcname(child)] = child
+                            pairs[self._arcname(child, base)] = child
                 elif path.is_file():
-                    pairs[self._arcname(path)] = path
+                    pairs[self._arcname(path, base)] = path
 
         source_run = self.inputs_run_id or self.run_id
         for source in task.inputs_from:
@@ -704,9 +941,10 @@ class Orchestrator:
 
         return list(pairs.items())
 
-    def _arcname(self, path: Path) -> str:
+    def _arcname(self, path: Path, base_dir: Path | None = None) -> str:
+        base = base_dir if base_dir is not None else self.plan.base_dir
         try:
-            return path.resolve().relative_to(self.plan.base_dir).as_posix()
+            return path.resolve().relative_to(base).as_posix()
         except ValueError:
             return path.name
 

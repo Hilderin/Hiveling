@@ -15,8 +15,12 @@ between the server and the worker happens over HTTP using zip archives.
 
 V1 characteristics:
 
-- Sequential execution (no parallelism).
-- The server dispatches each task to the first free worker (round-robin).
+- Tasks form a DAG (via `depends_on` / `inputs_from`) and are executed
+  **concurrently**: every task whose dependencies succeeded is dispatched to a
+  free worker, one task per worker at a time.
+- Fail fast: a failed task stops new dispatches, but the tasks already running
+  are allowed to finish before the run is finalized (and `wait_for_run`
+  returns).
 - Workers are configured once in `.data/workers.yaml`; the list is reloaded
   automatically when the file changes, so adding a worker needs no restart.
 - No authentication on the JSON API/dashboard; the MCP endpoint supports an
@@ -182,7 +186,7 @@ OpenCode ──MCP/HTTP──▶ http://127.0.0.1:8080/mcp ──▶ RunManager 
 | `get_plan_schema` | full `plan.yaml` reference plus a canonical example |
 | `create_plan` | create a plan from a **structured** plan object (typed input schema) |
 | `run_plan` | start a run from a plan name or inline YAML; returns `run_id` immediately |
-| `wait_for_run` | block until a run finishes (`terminal`) or changes; returns the state and the wake reason |
+| `wait_for_run` | block until a run finishes (`terminal`, waiting for any task still in flight) or changes; returns the state and the wake reason |
 | `list_runs` | paginated runs with search and status filter |
 | `get_run` | run status plus every task state (poll this) |
 | `get_task` | one task's status, result, error and changed files |
@@ -197,12 +201,15 @@ OpenCode ──MCP/HTTP──▶ http://127.0.0.1:8080/mcp ──▶ RunManager 
 
 ### Agentic loop
 
-A run is **fail fast**: it stops at the first failed task and marks every task
-that had not run yet as `skipped` with `skip_reason: run_stopped`. This gives an
-orchestrator a clean, explicit decision point instead of a half-finished plan.
-`resume_run` re-arms a finished run: its `failed` and `skipped` tasks (still in
-the plan) are reset to `pending` — the previous error is kept in `last_error`
-and `status.json`/`result.txt` are archived under
+A run is **fail fast**: a task failure stops the dispatching of new tasks and
+every task that had not run yet is marked `skipped` with
+`skip_reason: run_stopped`. Tasks that were already running are **not** killed:
+they run to completion before the run is finalized, so `wait_for_run` never
+returns while work is still in flight. This gives an orchestrator a clean,
+explicit decision point instead of a half-finished plan. `resume_run` re-arms a
+finished run: its `failed` and `skipped` tasks (still in the plan) are reset to
+`pending` — the previous error is kept in `last_error` and
+`status.json`/`result.txt` are archived under
 `history/<task>/<run>/attempt-N/` — and the run continues from where it stopped.
 
 A minimal orchestrator loop over MCP:
@@ -335,6 +342,7 @@ defaults:                # optional, applied to every task unless overridden
   auto: true             # pass --auto to opencode
   timeout_s: 600
   download: modified     # modified | all | none
+  max_parallel: 2        # optional: cap concurrent tasks (0/unset = one per free worker)
 
 tasks:
   - id: hello            # required, unique
@@ -374,7 +382,8 @@ workers:
 - The file is reloaded whenever it changes on disk, so adding or removing a
   worker does not require a server restart. A malformed file keeps the previous
   worker list and surfaces an error in the dashboard and `list_workers`.
-- Each task is dispatched to the first free reachable worker (round-robin).
+- Ready tasks are dispatched round-robin across the free reachable workers;
+  independent tasks run in parallel, one task per worker at a time.
 
 ## Persistence, recovery and live edits
 
@@ -395,7 +404,8 @@ it keeps every terminal task as-is, and:
   (`GET /jobs/{id}`) and its result adopted — worker jobs keep running while the
   server is down, so they are not lost;
 - it is marked `failed` only if the job/worker is gone or unreachable;
-- the run then continues from the first task without a result.
+- the run then resumes: every task without a result whose dependencies are
+  satisfied is dispatched again (in parallel).
 
 So an abrupt `kill -9` of the server is recoverable. Only a worker that also
 restarted loses its in-flight job (that task is then failed). Runs without a
@@ -505,14 +515,18 @@ Flags: `--log-dir` (default `./.data/logs`, env `WORKER_LOG_DIR`) and
 
 ## Current limitations
 
-- One active job per worker; no parallelism.
+- One active job per worker (worker-side concurrency is still 1; the
+  orchestrator schedules one task per worker). Cap the run's parallelism with
+  `--max-parallel` or `defaults.max_parallel`.
 - The JSON API and dashboard have no authentication (bind to a trusted
   network); the MCP endpoint can require a bearer token (see above).
 - Runs can be stopped as a whole (`cancel_run`) and individual tasks can be
   canceled (`cancel_task`); a canceled task makes the run finish as `failed` if
   no other outcome overrides it.
-- Recovery requires the worker to still hold the job: if the worker restarted
-  too, the in-flight task is marked `failed` (an in-flight task is not retried
+- After a failure, in-flight tasks run to completion (they are never killed);
+  only tasks that had not started yet are marked `skipped`. Recovery still
+  requires the worker to hold the job: if the worker restarted too, the
+  in-flight task is marked `failed` (an in-flight task is not retried
   automatically).
 - Live plan edits apply between tasks; a task already `running` is never
   interrupted.

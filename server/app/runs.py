@@ -153,6 +153,20 @@ class RunStore:
             self.write(run)
             return run
 
+    def update_from(self, run_id: str, mutate) -> dict | None:
+        """Atomically apply ``mutate(run)`` and persist the result.
+
+        The whole read-modify-write happens under the store lock, so callers
+        can safely reconcile a run while task threads update individual tasks.
+        """
+        with self._lock:
+            run = self.read(run_id)
+            if run is None:
+                return None
+            mutate(run)
+            self.write(run)
+            return run
+
     def list(self, limit: int = 100) -> list[dict]:
         runs: list[dict] = []
         if not self.root.exists():

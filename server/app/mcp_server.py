@@ -49,16 +49,18 @@ Typical flow:
 2. run_plan returns a run_id immediately (execution is asynchronous).
 3. wait_for_run(run_id) blocks until the run finishes (or use get_run / get_task
    to follow progress). Tasks end in succeeded, failed, canceled or skipped.
-4. A run stops at the first failed task (fail fast): the remaining tasks are
-   marked skipped. Analyse the failure, adjust with update_run_plan if needed,
-   then resume_run to re-run the failed and skipped tasks and continue the run.
+4. A run stops at the first failed task (fail fast): no new task is started,
+   but tasks already running finish before the run is reported terminal; the
+   remaining tasks are marked skipped. Analyse the failure, adjust with
+   update_run_plan if needed, then resume_run to re-run the failed and skipped
+   tasks and continue the run.
 5. cancel_run stops a whole run, cancel_task cancels a single task (running
    tasks are stopped, pending tasks never run, and the run continues).
 6. get_plan / update_plan inspect or edit a stored plan. To edit the plan of a
    run (even while it runs), use get_run_plan / update_run_plan.
 
-A run is sequential: tasks are dispatched to the first free worker in plan
-order, and a task whose dependencies did not succeed is skipped.
+A run is a DAG: tasks run in parallel, one per free worker, in plan/dependency
+order; a task whose dependencies did not succeed is skipped.
 
 To CREATE or EDIT a plan, learn its format first: call get_plan_schema (or
 read the resource hiveling://schema/plan) for the full reference and a canonical
@@ -356,8 +358,8 @@ def create_mcp_server(manager, config) -> MCPServer:
     def cancel_run(run_id: str) -> dict[str, Any]:
         """Cancel a whole run.
 
-        The running task's worker job is canceled and pending tasks are marked
-        canceled.
+        Every running task's worker job is canceled and pending tasks are
+        marked canceled.
         """
         if manager.store.read(run_id) is None:
             raise ToolError(f"run not found: {run_id}")
@@ -384,9 +386,11 @@ def create_mcp_server(manager, config) -> MCPServer:
         """Block until a run finishes (or changes), then return its state.
 
         ``until="terminal"`` (default) returns when the run reaches succeeded,
-        failed or canceled. ``until="change"`` returns after any state change.
-        ``timeout_s`` bounds the wait; on timeout the current state is returned
-        with ``timed_out=true``. Use this instead of polling get_run.
+        failed or canceled *and* every in-flight task has finished, so a
+        failure never returns while other tasks are still running.
+        ``until="change"`` returns after any state change. ``timeout_s`` bounds
+        the wait; on timeout the current state is returned with
+        ``timed_out=true``. Use this instead of polling get_run.
         """
         result = manager.wait_for_run(run_id, timeout_s=timeout_s, until=until)
         if result.get("reason") == "run not found":

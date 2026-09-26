@@ -48,9 +48,22 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 EVENTS_TAIL_LINES = 400
 WORKER_PROBE_TIMEOUT = 2.0
 TASK_TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "skipped"}
+# A run is only reported terminal to waiters once no task is still running:
+# after a failure the orchestrator stops dispatching but lets the in-flight
+# tasks finish, so ``wait_for_run`` must not wake early on the run status alone.
+TASK_ACTIVE_STATUSES = {"running"}
 # A run owner is considered alive if it refreshed its heartbeat within this
 # window; otherwise a restart is allowed to recover the run.
 LEASE_TTL_S = 30.0
+
+
+def is_run_terminal(run: dict) -> bool:
+    """True when the run finished and no task is still in flight."""
+    if run.get("status") not in TERMINAL_RUN_STATUSES:
+        return False
+    return not any(
+        task.get("status") in TASK_ACTIVE_STATUSES for task in run.get("tasks", [])
+    )
 
 
 @dataclass
@@ -59,6 +72,8 @@ class DashboardConfig:
     plans_dir: Path
     poll_interval: float = 2.0
     worker_wait_timeout: float = 1800.0
+    # None = use the plan's max_parallel (or unlimited when the plan has none).
+    max_parallel: int | None = None
     workers_file: Path | None = None
     heartbeat_s: float = 60.0
     mcp_token: str | None = None
@@ -122,6 +137,7 @@ class RunManager:
             poll_interval=self.config.poll_interval,
             worker_wait_timeout=self.config.worker_wait_timeout,
             only=only,
+            max_parallel=self.config.max_parallel,
             run_store=self.store,
             run_id=run_id,
             cancel_event=cancel_event,
@@ -314,6 +330,7 @@ class RunManager:
             poll_interval=self.config.poll_interval,
             worker_wait_timeout=self.config.worker_wait_timeout,
             only=run.get("only") or None,
+            max_parallel=self.config.max_parallel,
             run_store=self.store,
             run_id=run_id,
             cancel_event=cancel_event,
@@ -435,8 +452,11 @@ class RunManager:
         """Block until the run reaches a terminal state (default) or changes.
 
         ``until`` is ``terminal`` (succeeded/failed/canceled) or ``change``
-        (any state change). Returns the run state plus the wake reason; on
-        timeout it returns ``{"timed_out": true}`` with the current state.
+        (any state change). A run counts as terminal only once every in-flight
+        task has finished, so a failure never makes the waiter return while
+        other tasks are still running. Returns the run state plus the wake
+        reason; on timeout it returns ``{"timed_out": true}`` with the current
+        state.
 
         The condition is only used to *wake up* on changes; the run document is
         always read without holding the manager lock, so the orchestrator (which
@@ -453,7 +473,7 @@ class RunManager:
             if run is None:
                 return {"ok": False, "reason": "run not found"}
             status = run.get("status")
-            if until == "terminal" and status in TERMINAL_RUN_STATUSES:
+            if until == "terminal" and is_run_terminal(run):
                 return {"run_id": run_id, "status": status, "event": "terminal", "run": run}
 
             with self._condition:
@@ -760,6 +780,16 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
             detail["event_lines"] = total
             stderr, _ = read_text(directory / "stderr.log", EVENTS_TAIL_LINES)
             detail["stderr"] = stderr
+        # A task that has not started yet has no history/request.json; resolve
+        # the prompt from the run's plan so it is visible before the job starts.
+        if not detail["request"].get("prompt"):
+            plan_file = manager.run_plan_file(run_id)
+            if plan_file is not None:
+                try:
+                    plan = load_plan(plan_file, base_dir=run.get("base_dir"))
+                    detail["request"]["prompt"] = plan.task_by_id(task_id).prompt
+                except PlanError:
+                    pass
         return detail
 
     @app.get("/api/runs/{run_id}/tasks/{task_id}/files")

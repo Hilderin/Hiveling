@@ -46,6 +46,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .succeeded { background:var(--succeeded); } .failed { background:var(--failed); }
   .skipped { background:var(--skipped); } .canceled { background:var(--canceled); }
   .badge { font-size:11px; padding:1px 6px; border-radius:10px; border:1px solid var(--border); color:var(--muted); }
+  .badge.worker { border-color:var(--accent); color:var(--accent); }
   ul.tree { list-style:none; margin:0; padding-left:16px; }
   ul.tree > li { margin:3px 0; }
   .taskrow { display:inline-flex; align-items:center; gap:8px; padding:3px 8px; border-radius:6px; cursor:pointer;
@@ -189,6 +190,11 @@ function esc(s) {
 }
 function fmtDur(s) { return s == null ? '' : (Math.round(s*10)/10) + 's'; }
 function fmtTime(ts) { return ts ? new Date(ts*1000).toLocaleString() : ''; }
+function tokenTotal(t) {
+  if (!t) return 0;
+  if (t.total != null) return t.total;
+  return (t.input||0) + (t.output||0) + (t.reasoning||0);
+}
 
 async function refresh(silent) {
   try {
@@ -327,10 +333,11 @@ function renderTree(tasks) {
     const active = state.task === id ? 'active' : '';
     const deps = [...new Set([...(t.depends_on||[]), ...(t.inputs_from||[])])];
     const dep = deps.length ? ` <span class="badge">&larr; ${esc(deps.join(', '))}</span>` : '';
-    const model = t.model ? ` <span class="badge">${esc(t.model)}</span>` : '';
+    const model = t.model ? ` <span class="badge" title="model">${esc(t.model)}</span>` : '';
+    const worker = t.worker ? ` <span class="badge worker" title="worker">${esc(t.worker)}</span>` : '';
     return `<li><button type="button" class="taskrow ${active}" onclick="loadTask('${id}')">
         <span class="dot ${t.status}"></span><b>${esc(id)}</b>
-        <span class="muted">${t.status}${t.duration_s!=null?' '+fmtDur(t.duration_s):''}</span>${model}${dep}
+        <span class="muted">${t.status}${t.duration_s!=null?' '+fmtDur(t.duration_s):''}</span>${worker}${model}${dep}
       </button>${kids ? '<ul class="tree">' + kids + '</ul>' : ''}</li>`;
   }
   const items = (roots.length ? roots : tasks.map(t => t.id)).map(node).join('');
@@ -361,21 +368,21 @@ function renderTask() {
     ['model', t.model || '(default)'],
     ['agent', t.agent || '-'],
     ['duration', fmtDur(t.duration_s)],
-    ['tokens', s.tokens ? (s.tokens.total + ' (in ' + s.tokens.input + ' / out ' + s.tokens.output + ')') : '-'],
+    ['tokens', s.tokens ? (tokenTotal(s.tokens) + ' (in ' + (s.tokens.input||0) + ' / out ' + (s.tokens.output||0) + ')') : '-'],
     ['cost', s.cost != null ? s.cost : '-'],
     ['session', s.session_id || '-'],
     ['depends on', (t.depends_on||[]).join(', ') || '-'],
     ['inputs from', (t.inputs_from||[]).join(', ') || '-'],
   ];
   let html = '<table>' + rows.map(([k,v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join('') + '</table>';
+  if (d.request && d.request.prompt)
+    html += `<p><b>prompt</b><pre>${esc(d.request.prompt)}</pre></p>`;
+  if (s.tool_calls && s.tool_calls.length)
+    html += `<p><b>tool calls</b><pre>${esc(s.tool_calls.join('\n'))}</pre></p>`;
+  if (d.result) html += `<p><b>result</b><pre>${esc(d.result)}</pre></p>`;
   if (t.error) html += `<p><b>error</b><pre>${esc(t.error)}</pre></p>`;
   if (t.changed_files && t.changed_files.length)
     html += `<p><b>changed files</b><pre>${esc(t.changed_files.join('\n'))}</pre></p>`;
-  if (d.result) html += `<p><b>result</b><pre>${esc(d.result)}</pre></p>`;
-  if (s.tool_calls && s.tool_calls.length)
-    html += `<p><b>tool calls</b><pre>${esc(s.tool_calls.join('\n'))}</pre></p>`;
-  if (d.request && d.request.prompt)
-    html += `<p><b>prompt</b><pre>${esc(d.request.prompt)}</pre></p>`;
   if (d.events) html += `<details><summary>events (${d.event_lines} lines)</summary><pre>${esc(d.events)}</pre></details>`;
   if (d.stderr) html += `<details><summary>stderr</summary><pre>${esc(d.stderr)}</pre></details>`;
   document.getElementById('task-body').innerHTML = html;
