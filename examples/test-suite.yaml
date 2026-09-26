@@ -1,10 +1,5 @@
 version: 1
 
-workers:
-  - name: local
-    host: 127.0.0.1
-    port: 8787
-
 defaults:
   model: opencode-go/deepseek-v4.1-flash
   agent: build

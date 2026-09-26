@@ -15,12 +15,13 @@ import uuid
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from rich.console import Console
 from rich.table import Table
 
 from .history import History
-from .plan import Plan, PlanError, Task
+from .plan import Plan, PlanError, Task, WorkerEndpoint
 from .runs import RunStore, build_task_states, new_run_id
 from .worker_client import WorkerBusy, WorkerClient, WorkerError
 
@@ -57,6 +58,9 @@ class Orchestrator:
         inputs_run_id: str | None = None,
         assume_deps_ok: bool = False,
         quiet: bool = False,
+        workers: list[WorkerEndpoint] | None = None,
+        workers_provider: Callable[[], list[WorkerEndpoint]] | None = None,
+        task_cancel_provider: Callable[[str], bool] | None = None,
     ) -> None:
         self.plan = plan
         self.history = History(history_dir)
@@ -72,6 +76,10 @@ class Orchestrator:
         self.inputs_run_id = inputs_run_id
         self.assume_deps_ok = assume_deps_ok
         self.quiet = quiet
+        self.workers = list(workers or [])
+        self.workers_provider = workers_provider
+        self.task_cancel_provider = task_cancel_provider
+        self._clients: dict[str, WorkerClient] = {}
         self._rr = 0  # round-robin across workers
 
     # ------------------------------------------------------------------ public
@@ -81,6 +89,10 @@ class Orchestrator:
 
     def _is_canceled(self) -> bool:
         return self.cancel_event is not None and self.cancel_event.is_set()
+
+    def _task_is_canceled(self, task_id: str) -> bool:
+        """True when this specific task was canceled via cancel_task."""
+        return self.task_cancel_provider is not None and self.task_cancel_provider(task_id)
 
     def _store_task(self, task_id: str, **fields) -> None:
         if self.run_store is not None:
@@ -106,11 +118,13 @@ class Orchestrator:
                 inputs_run_id=self.inputs_run_id,
             )
 
-        clients = [WorkerClient(worker) for worker in self.plan.workers]
+        if not self._current_workers():
+            self._log("[yellow]no workers configured (workers.yaml)[/]")
+
         results: dict[str, str] = {}
         canceled = False
         try:
-            self._print_workers(clients)
+            self._print_workers()
             tasks = self.plan.tasks
             for index, task in enumerate(tasks):
                 if self.only is not None and task.id not in self.only:
@@ -123,6 +137,12 @@ class Orchestrator:
                         results[remaining.id] = "canceled"
                         self._store_task(remaining.id, status="canceled", error="canceled by user")
                     break
+
+                if self._task_is_canceled(task.id):
+                    self._log(f"[yellow]canceled[/] {task.id} [dim](canceled while pending)[/]")
+                    results[task.id] = "canceled"
+                    self._store_task(task.id, status="canceled", error="canceled by user")
+                    continue
 
                 failed_deps: list[str] = []
                 if not self.assume_deps_ok:
@@ -143,19 +163,22 @@ class Orchestrator:
                     )
                     continue
 
-                result = self._run_task(task, clients)
+                result = self._run_task(task)
                 results[task.id] = result.status
-                if result.status == "canceled":
+                if result.status == "canceled" and self._is_canceled():
                     canceled = True
-                if result.status != "succeeded" and not self.keep_going:
+                stop_run = result.status != "succeeded" and not self.keep_going
+                if result.status == "canceled" and not self._is_canceled():
+                    # A single task was canceled with cancel_task: the run continues.
+                    stop_run = False
+                if stop_run:
                     if result.status == "canceled":
                         self._log("[yellow]run canceled[/]")
                     else:
                         self._log("[red]stopping after failure[/] (use --keep-going to continue)")
                     break
         finally:
-            for client in clients:
-                client.close()
+            self._close_clients()
 
         if canceled:
             self._cancel_pending_tasks()
@@ -183,10 +206,46 @@ class Orchestrator:
         return "succeeded"
 
     # ----------------------------------------------------------------- workers
-    def _print_workers(self, clients: list[WorkerClient]) -> None:
+    def _current_workers(self) -> list[WorkerEndpoint]:
+        """Workers from the provider (live file) or the static list."""
+        if self.workers_provider is not None:
+            try:
+                return self.workers_provider()
+            except Exception:
+                return self.workers
+        return self.workers
+
+    def _sync_clients(self) -> list[WorkerClient]:
+        """Refresh the client pool from the current worker list.
+
+        Called before each dispatch and on every wait iteration, so a worker
+        added to workers.yaml while a run is in flight is picked up.
+        """
+        workers = {w.url: w for w in self._current_workers()}
+        for url in list(self._clients):
+            if url not in workers:
+                try:
+                    self._clients[url].close()
+                except Exception:
+                    pass
+                del self._clients[url]
+        for url, endpoint in workers.items():
+            if url not in self._clients:
+                self._clients[url] = WorkerClient(endpoint)
+        return list(self._clients.values())
+
+    def _close_clients(self) -> None:
+        for client in self._clients.values():
+            try:
+                client.close()
+            except Exception:
+                pass
+        self._clients.clear()
+
+    def _print_workers(self) -> None:
         if self.quiet:
             return
-        for client in clients:
+        for client in self._sync_clients():
             try:
                 health = client.health()
                 state = "[red]busy[/]" if health.get("busy") else "[green]free[/]"
@@ -211,13 +270,13 @@ class Orchestrator:
                 free.append(client)
         return free
 
-    def _wait_for_worker(self, clients: list[WorkerClient]) -> WorkerClient | None:
+    def _wait_for_worker(self, task: Task) -> WorkerClient | None:
         deadline = time.time() + self.worker_wait_timeout
         announced = False
         while time.time() < deadline:
-            if self._is_canceled():
+            if self._is_canceled() or self._task_is_canceled(task.id):
                 return None
-            free = self._free_clients(clients)
+            free = self._free_clients(self._sync_clients())
             if free:
                 client = free[self._rr % len(free)]
                 self._rr += 1
@@ -229,13 +288,14 @@ class Orchestrator:
         return None
 
     # ------------------------------------------------------------------ tasks
-    def _run_task(self, task: Task, clients: list[WorkerClient]) -> TaskResult:
+    def _run_task(self, task: Task) -> TaskResult:
         while True:
-            client = self._wait_for_worker(clients)
+            client = self._wait_for_worker(task)
             if client is None:
+                canceled = self._is_canceled() or self._task_is_canceled(task.id)
                 return self._record_result(
-                    TaskResult(task.id, "canceled" if self._is_canceled() else "failed",
-                               error="canceled by user" if self._is_canceled() else "no worker available")
+                    TaskResult(task.id, "canceled" if canceled else "failed",
+                               error="canceled by user" if canceled else "no worker available")
                 )
             try:
                 result = self._execute_on(client, task)
@@ -341,7 +401,7 @@ class Orchestrator:
         started = time.time()
 
         while True:
-            if self._is_canceled():
+            if self._is_canceled() or self._task_is_canceled(task.id):
                 try:
                     client.cancel(job_id)
                 except WorkerError:

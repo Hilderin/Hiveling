@@ -18,6 +18,7 @@ from rich.console import Console  # noqa: E402
 from app.orchestrator import Orchestrator  # noqa: E402
 from app.plan import PlanError, load_plan  # noqa: E402
 from app.runs import RunStore, new_run_id  # noqa: E402
+from app.workers import WorkerRegistry  # noqa: E402
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -35,6 +36,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--runs-dir",
         default=".data/runs",
         help="run state directory shown in the dashboard (default: ./.data/runs)",
+    )
+    parser.add_argument(
+        "--workers-file",
+        default=".data/workers.yaml",
+        help="workers configuration file (default: ./.data/workers.yaml)",
     )
     parser.add_argument(
         "--poll-interval",
@@ -83,6 +89,9 @@ def main(argv: list[str] | None = None) -> int:
 
     run_id = new_run_id()
     run_store = RunStore(Path(args.runs_dir).expanduser().resolve())
+    registry = WorkerRegistry(Path(args.workers_file).expanduser().resolve())
+    if registry.error():
+        console.print(f"[yellow]workers:[/] {registry.error()}")
     console.print(f"[dim]run id: {run_id}[/]")
 
     orchestrator = Orchestrator(
@@ -96,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
         only=args.only,
         run_store=None if args.dry_run else run_store,
         run_id=run_id,
+        workers_provider=registry.get,
     )
     return orchestrator.run()
 

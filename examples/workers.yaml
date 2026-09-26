@@ -1,0 +1,14 @@
+# Worker list used by the server (dashboard + MCP) and the CLI.
+#
+# Default location: <data-dir>/workers.yaml, i.e. .data/workers.yaml. Override
+# with --workers-file. The file is reloaded automatically when it changes, so
+# adding or removing a worker does not require restarting the server.
+
+workers:
+  - name: windows11
+    host: 10.0.0.174
+    port: 8787
+
+  - name: local
+    host: 127.0.0.1
+    port: 8787
