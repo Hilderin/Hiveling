@@ -10,8 +10,8 @@ Produce the analysis with:
 
 1. **Objective & acceptance criteria** — restated and mapped one-to-one, so
    every criterion is traceable to a work item.
-2. **Scope** — what is in, what is explicitly out (mirror `feature.md`), and any
-   ambiguity in the brief with the assumption you would make.
+2. **Scope** — what is in, what is explicitly out (mirror the requirement), and
+   any ambiguity with the assumption you would make.
 3. **Decomposition** — the smallest set of *independent* work items. For each:
    the files it will create/edit, its inputs, its dependencies, and the other
    items it is likely to conflict with.
