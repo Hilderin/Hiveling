@@ -178,6 +178,29 @@ class TaskInput(BaseModel):
         return self
 
 
+class GateInput(BaseModel):
+    """A gate: a server-configured, read-only node that judges other tasks.
+
+    The plan supplies the criteria (``prompt``) only: the agent, the
+    permissions and the machine-readable verdict contract are owned by the
+    server. When the gate does not answer ``VALID``, the analysed tasks are
+    reset and re-run, bounded by ``max_attempts``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(description="Unique gate id, used as a dependency by downstream tasks.")
+    tasks: list[str] = Field(description="Task ids this gate analyses and can reset.")
+    prompt: str = Field(description="The criteria the gate checks (the agent is server-provided).")
+    max_attempts: int | None = Field(
+        default=None, description="Max gate evaluations before the run fails (default 20)."
+    )
+    model: str | None = Field(default=None, description="Override the default model.")
+    timeout_s: float | None = Field(default=None, description="Override the default timeout.")
+    variant: str | None = Field(default=None, description="Model variant.")
+    title: str | None = Field(default=None, description="Human-readable title (defaults to id).")
+
+
 class PlanInput(BaseModel):
     """A complete plan.yaml, version 1.
 
@@ -190,6 +213,10 @@ class PlanInput(BaseModel):
     version: int = Field(default=1, description="Plan format version (currently 1).")
     defaults: DefaultsInput | None = Field(default=None, description="Defaults applied to every task.")
     tasks: list[TaskInput] = Field(description="Tasks to run, in dependency order (required).")
+    gates: list[GateInput] | None = Field(
+        default=None,
+        description="Optional gates: read-only nodes that judge tasks and reset them when they answer without VALID.",
+    )
 
 
 def plan_to_dict(plan: PlanInput) -> dict:
@@ -249,6 +276,25 @@ Top-level keys:
     `skills`) or **worker-local paths** (`from` bundles, `agents_paths`,
     `skills_paths`, `agents_md`, or the verbose `sources` list), so the plan
     carries paths instead of re-writing agent/skill bodies.
+
+- `gates` (optional list): read-only checkpoints over tasks. Each gate:
+  - `id` (required, unique): a node downstream tasks depend on.
+  - `tasks` (required, list of task ids): the tasks the gate analyses. A task
+    may belong to at most one gate, and a gate cannot analyse another gate.
+  - `prompt` (required): the criteria the gate checks. The gate agent,
+    permissions and verdict contract are provided by the server; do not set
+    `agent`.
+  - `max_attempts` (int, default 20): maximum number of gate evaluations before
+    the run fails. Each rejection consumes one, so at most `max_attempts - 1`
+    rework rounds are allowed.
+  - `model`, `timeout_s`, `variant`, `title` (optional).
+  A gate runs on a worker with no repository and reads the decision material the
+  server uploads under `./_hiveling/` (the plan, each analysed task's status,
+  result and downloaded files). It answers with a standalone `VALID` line, or
+  with the corrections it requires. Without `VALID`, the analysed tasks and the
+  gate are reset and re-run, bounded by `max_attempts`; exhaustion fails the run.
+  Every consumer of a gated task must depend on the gate, not on the task
+  directly (a plan that violates this is rejected).
 
 Built-in providers:
 
@@ -341,5 +387,12 @@ tasks:
 
   - id: summarize
     prompt: "Read report.txt and summarize it in a single sentence."
+    depends_on: [report-gate]
     inputs_from: [write-report]
+
+gates:
+  - id: report-gate
+    tasks: [write-report]
+    prompt: "report.txt exists and contains exactly the lines one, two, three."
+    max_attempts: 5
 """

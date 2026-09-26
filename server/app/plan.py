@@ -7,6 +7,8 @@ from pathlib import Path
 
 import yaml
 
+from .gate import DEFAULT_MAX_ATTEMPTS, GATE_AGENT_ID, GATE_AGENT_MD
+
 
 class PlanError(Exception):
     """Plan reading or validation error."""
@@ -36,6 +38,12 @@ class Task:
     resources: list[dict] = field(default_factory=list)
     artifacts: dict = field(default_factory=dict)
     opencode: dict = field(default_factory=dict)
+    # A gate is a read-only node that judges the tasks it lists; it is compiled
+    # from the top-level ``gates`` key into a Task so scheduling and the
+    # topological sort are reused unchanged.
+    kind: str = "task"  # task | gate
+    gate_targets: list[str] = field(default_factory=list)
+    gate_max_attempts: int = DEFAULT_MAX_ATTEMPTS
 
 
 @dataclass
@@ -195,6 +203,90 @@ def _parse_task(raw: dict, defaults: dict, base_dir: Path) -> Task:
     )
 
 
+def _parse_gate(raw: dict, defaults: dict, base_dir: Path) -> Task:
+    """Compile a top-level ``gates`` entry into a gate Task.
+
+    Gates do not inherit ``defaults.resources``/``opencode``/``requirements``:
+    they run with the server-provided agent in a fresh workspace, so a plan's
+    repo paths or permission fragments cannot leak into them.
+    """
+    if not isinstance(raw, dict):
+        raise PlanError(f"invalid gate: {raw!r}")
+    gate_id = raw.get("id")
+    if not gate_id:
+        raise PlanError("every gate must have an 'id'")
+    targets = raw.get("tasks")
+    if not isinstance(targets, list) or not targets:
+        raise PlanError(f"gate '{gate_id}': 'tasks' must be a non-empty list of task ids")
+    max_attempts = raw.get("max_attempts")
+    max_attempts = DEFAULT_MAX_ATTEMPTS if max_attempts is None else int(max_attempts)
+    if max_attempts < 1:
+        raise PlanError(f"gate '{gate_id}': 'max_attempts' must be >= 1")
+
+    timeout = raw.get("timeout_s", defaults.get("timeout_s"))
+    return Task(
+        id=str(gate_id),
+        prompt=_load_prompt(raw, base_dir),
+        model=raw.get("model", defaults.get("model")),
+        agent=GATE_AGENT_ID,
+        timeout_s=float(timeout) if timeout is not None else None,
+        variant=raw.get("variant", defaults.get("variant")),
+        title=raw.get("title") or str(gate_id),
+        depends_on=[str(target) for target in targets],
+        download="none",
+        resources=[],
+        opencode={"agents": {GATE_AGENT_ID: GATE_AGENT_MD}},
+        kind="gate",
+        gate_targets=[str(target) for target in targets],
+        gate_max_attempts=max_attempts,
+    )
+
+
+def _validate_gates(tasks: list[Task]) -> None:
+    """A gate analyses plain tasks, and their consumers must depend on it.
+
+    Without this rule a task could consume a gated task directly and run on an
+    un-approved artifact (the review-as-decoration problem).
+    """
+    by_id = {task.id: task for task in tasks}
+    gated: dict[str, str] = {}
+    for task in tasks:
+        if task.kind != "gate":
+            continue
+        for target_id in task.gate_targets:
+            target = by_id.get(target_id)
+            if target is None:
+                raise PlanError(
+                    f"gate '{task.id}' analyses an unknown task: {target_id}"
+                )
+            if target.kind == "gate":
+                raise PlanError(
+                    f"gate '{task.id}' cannot analyse another gate: {target_id}"
+                )
+            if target_id in gated:
+                raise PlanError(
+                    f"task '{target_id}' is analysed by more than one gate "
+                    f"('{gated[target_id]}' and '{task.id}')"
+                )
+            gated[target_id] = task.id
+
+    for task in tasks:
+        if task.kind == "gate":
+            continue
+        deps = set(task.depends_on) | set(task.inputs_from)
+        for dep in deps:
+            gate_id = gated.get(dep)
+            if gate_id and gate_id not in deps and gated.get(task.id) != gate_id:
+                # A task inside the same gated unit may consume another target
+                # (e.g. a reviewer that depends on the producer it reviews):
+                # both are reset together when the gate rejects, so there is no
+                # un-approved artifact to protect against.
+                raise PlanError(
+                    f"task '{task.id}' consumes gated task '{dep}' but does "
+                    f"not depend on its gate '{gate_id}'"
+                )
+
+
 def _validate_and_order(tasks: list[Task]) -> list[Task]:
     by_id = {task.id: task for task in tasks}
     if len(by_id) != len(tasks):
@@ -264,13 +356,18 @@ def load_plan(path: str | Path, *, base_dir: str | Path | None = None) -> Plan:
     tasks_raw = raw.get("tasks")
     if not tasks_raw:
         raise PlanError("'tasks' is required")
+    gates_raw = raw.get("gates") or []
+    if not isinstance(gates_raw, list):
+        raise PlanError("'gates' must be a list")
     defaults = raw.get("defaults") or {}
 
     resolve_base = (
         Path(base_dir).expanduser().resolve() if base_dir else plan_path.parent
     )
     tasks = [_parse_task(entry, defaults, resolve_base) for entry in tasks_raw]
-    ordered = _validate_and_order(tasks)
+    gates = [_parse_gate(entry, defaults, resolve_base) for entry in gates_raw]
+    ordered = _validate_and_order(tasks + gates)
+    _validate_gates(ordered)
 
     return Plan(
         path=plan_path,

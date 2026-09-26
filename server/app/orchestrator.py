@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import glob
 import io
+import json
 import logging
 import queue
+import shutil
 import threading
 import time
 import uuid
@@ -27,6 +29,12 @@ from typing import Callable
 from rich.console import Console
 from rich.table import Table
 
+from .gate import (
+    GATE_AGENT_ID,
+    build_gate_prompt,
+    is_valid_verdict,
+    with_gate_feedback,
+)
 from .history import History
 from .plan import Plan, PlanError, Task, WorkerEndpoint, load_plan
 from .runs import RunStore, build_task_states, new_run_id
@@ -51,6 +59,9 @@ class TaskResult:
     commits: list = field(default_factory=list)
     artifacts: list = field(default_factory=list)
     merge: dict = field(default_factory=dict)
+    # Gate tasks only: the raw answer and whether it contains a VALID line.
+    text: str = ""
+    gate_valid: bool | None = None
 
 
 class Orchestrator:
@@ -113,9 +124,28 @@ class Orchestrator:
         self.resume = resume
         self.initial_results = dict(initial_results or {})
         self.resume_jobs = dict(resume_jobs or {})
+        # Gate bookkeeping: an in-memory mirror of the run's gate state, so the
+        # loop can decide without a store round-trip; it is persisted on the
+        # task states and reloaded on recovery.
+        self._gate_attempts: dict[str, int] = {}
+        self._gate_feedback: dict[str, str] = {}
+        if self.run_store is not None and self.run_id:
+            self._load_gate_state()
         self._plan_stamp = self._stamp(self.plan_path)
         self._clients: dict[str, WorkerClient] = {}
         self._rr = 0  # round-robin across workers
+
+    def _load_gate_state(self) -> None:
+        run = self.run_store.read(self.run_id)
+        if not run:
+            return
+        for state in run.get("tasks", []):
+            attempts = state.get("gate_attempt") or 0
+            if attempts:
+                self._gate_attempts[state["id"]] = attempts
+            feedback = state.get("gate_feedback")
+            if feedback:
+                self._gate_feedback[state["id"]] = feedback
 
     @staticmethod
     def _stamp(path: Path) -> tuple[int, int] | None:
@@ -440,7 +470,7 @@ class Orchestrator:
         results: dict[str, str],
         running: dict[str, tuple[WorkerClient | None, threading.Thread]],
     ) -> bool:
-        """Apply finished-task events. Returns True when a task freshly failed."""
+        """Apply finished-task events. Returns True when the run must stop."""
         new_failure = False
         for kind, task_id, client, result in events:
             running.pop(task_id, None)
@@ -449,6 +479,31 @@ class Orchestrator:
                 self._log(f"[yellow]{name} busy[/], looking for another worker")
                 continue
             self._record_result(result)
+            task = self._plan_task(task_id)
+            if task is not None and task.kind == "gate" and result.gate_valid is not None:
+                # Keep the persisted verdict in sync with the last evaluation so
+                # a gate that was rejected once then passed no longer shows the
+                # stale INVALID.
+                self._store_task(
+                    task_id, gate_verdict="VALID" if result.gate_valid else "INVALID"
+                )
+            if (
+                task is not None
+                and task.kind == "gate"
+                and result.status == "succeeded"
+                and result.gate_valid is False
+            ):
+                # A gate that answered without VALID is a *rejection*: reset the
+                # analysed tasks (bounded) and re-run the gate, instead of
+                # failing the run on the first negative verdict.
+                reset = self._handle_gate_rejection(task, result)
+                if reset is None:
+                    results[task_id] = "failed"
+                    new_failure = True
+                else:
+                    for reset_id in reset:
+                        results.pop(reset_id, None)
+                continue
             results[task_id] = result.status
             logger.info("run %s: task %s -> %s", self.run_id, task_id, result.status)
             if result.status == "failed":
@@ -849,21 +904,41 @@ class Orchestrator:
 
     def _execute_on(self, client: WorkerClient, task: Task) -> TaskResult:
         job_id = f"{task.id}-{uuid.uuid4().hex[:8]}"
+        is_gate = task.kind == "gate"
+
+        if is_gate:
+            # The gate is server-configured: hardcoded agent, no resources, a
+            # fresh workspace, and the decision material uploaded as files.
+            attempt = self._gate_attempts.get(task.id, 0) + 1
+            prompt = build_gate_prompt(
+                task.prompt, task.gate_targets, attempt, task.gate_max_attempts
+            )
+            resources: list[dict] = []
+            agent = GATE_AGENT_ID
+            opencode = task.opencode
+            artifacts: dict = {"download": "none"}
+        else:
+            feedback = self._gate_feedback.get(task.id)
+            prompt = with_gate_feedback(task.prompt, feedback) if feedback else task.prompt
+            resources = self._retry_resources(task.resources) if feedback else task.resources
+            agent = task.agent
+            opencode = task.opencode
+            artifacts = task.artifacts
 
         request = {
             "job_id": job_id,
             "task_id": task.id,
             "run_id": self.run_id,
-            "prompt": task.prompt,
+            "prompt": prompt,
             "model": task.model,
-            "agent": task.agent,
+            "agent": agent,
             "timeout_s": task.timeout_s,
             "variant": task.variant,
             "title": task.title,
             "env": task.env,
-            "resources": self._substitute_resources(task.id, task.resources),
-            "artifacts": task.artifacts,
-            "opencode": task.opencode,
+            "resources": self._substitute_resources(task.id, resources),
+            "artifacts": artifacts,
+            "opencode": opencode,
         }
         # 'files' sent to OpenCode is intentionally empty: input files are
         # already extracted into the working directory.
@@ -873,7 +948,12 @@ class Orchestrator:
         # Snapshot the base_dir once: a live plan edit must not change where
         # this already-running task resolves its inputs.
         base_dir = self.plan.base_dir
-        inputs = self._resolve_inputs(task, base_dir)
+        if is_gate:
+            inputs = self._gate_inputs(task)
+        else:
+            inputs = self._resolve_inputs(task, base_dir)
+            if self._gate_feedback.get(task.id):
+                inputs = inputs + self._feedback_inputs(task)
 
         client.create_job(spec)  # raises WorkerBusy when busy
         self._store_task(task.id, status="running", worker=client.endpoint.name,
@@ -928,6 +1008,7 @@ class Orchestrator:
 
         self._print_result(status, directory)
         state = status.get("status", "failed")
+        text = status.get("result_text") or ""
         logger.info(
             "run %s: task %s finished status=%s duration=%ss",
             self.run_id,
@@ -948,6 +1029,8 @@ class Orchestrator:
             commits=list(status.get("commits") or []),
             artifacts=list(status.get("artifacts") or []),
             merge=dict(status.get("merge") or {}),
+            text=text,
+            gate_valid=is_valid_verdict(text) if task.kind == "gate" else None,
         )
 
     def _poll(self, client: WorkerClient, job_id: str, task: Task) -> dict:
@@ -1078,6 +1161,227 @@ class Orchestrator:
             for arc, path in pairs:
                 archive.write(path, arc)
         return buffer.getvalue()
+
+    # ------------------------------------------------------------------- gates
+    def _plan_task(self, task_id: str) -> Task | None:
+        for task in self.plan.tasks:
+            if task.id == task_id:
+                return task
+        return None
+
+    @staticmethod
+    def _retry_resources(resources: list[dict]) -> list[dict]:
+        """Force-push on a retry: the branch already exists on the remote.
+
+        Safe because the consumer depends on the gate, so no downstream task has
+        read the rejected attempt's branch.
+        """
+        retried: list[dict] = []
+        for resource in resources or []:
+            if resource.get("type") == "git":
+                resource = dict(resource)
+                options = dict(resource.get("with") or {})
+                options["force"] = True
+                resource["with"] = options
+            retried.append(resource)
+        return retried
+
+    def _feedback_inputs(self, task: Task) -> list[tuple[str, Path]]:
+        """The gate rejection, uploaded for a retried task to read."""
+        root = self.history.run_dir(task.id, self.run_id) / "gate-feedback"
+        target = root / "_hiveling" / "gate-feedback.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(
+                {"task": task.id, "feedback": self._gate_feedback.get(task.id, "")},
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return [("_hiveling/gate-feedback.json", target)]
+
+    def _gate_inputs(self, task: Task) -> list[tuple[str, Path]]:
+        """Build the decision material a gate reads under ``_hiveling/``.
+
+        A gate runs with no repository, so it can only judge what the
+        orchestrator hands it: the plan, every analysed task's status/result and
+        the files that task downloaded. No branch concept is involved.
+        """
+        root = self.history.run_dir(task.id, self.run_id) / "gate-input"
+        shutil.rmtree(root, ignore_errors=True)
+        hiveling = root / "_hiveling"
+        (hiveling / "tasks").mkdir(parents=True, exist_ok=True)
+
+        run = self.run_store.read(self.run_id) if self.run_store is not None else None
+        states = {state.get("id"): state for state in (run or {}).get("tasks", [])}
+
+        attempt = self._gate_attempts.get(task.id, 0) + 1
+        previous = states.get(task.id, {}).get("gate_feedback")
+        self._write_json(
+            hiveling / "gate.json",
+            {
+                "id": task.id,
+                "attempt": attempt,
+                "max_attempts": task.gate_max_attempts,
+                "criteria": task.prompt,
+                "targets": list(task.gate_targets),
+                "previous_verdicts": [previous] if previous else [],
+            },
+        )
+        self._write_json(
+            hiveling / "plan.json",
+            {
+                "tasks": [
+                    {
+                        "id": item.id,
+                        "kind": item.kind,
+                        "prompt": item.prompt,
+                        "depends_on": item.depends_on,
+                        "inputs_from": item.inputs_from,
+                        "agent": item.agent,
+                    }
+                    for item in self.plan.tasks
+                ]
+            },
+        )
+
+        results: dict = {}
+        for target_id in task.gate_targets:
+            state = states.get(target_id, {})
+            plan_task = self._plan_task(target_id)
+            task_dir = hiveling / "tasks" / target_id
+            task_dir.mkdir(parents=True, exist_ok=True)
+            (task_dir / "prompt.txt").write_text(
+                plan_task.prompt if plan_task else "", encoding="utf-8"
+            )
+            history_dir = self.history.run_dir(target_id, self.run_id)
+            result_path = history_dir / "result.txt"
+            result_text = (
+                result_path.read_text(encoding="utf-8", errors="replace")
+                if result_path.is_file()
+                else ""
+            )
+            (task_dir / "result.txt").write_text(result_text, encoding="utf-8")
+            files_dir = history_dir / "files"
+            if files_dir.is_dir():
+                shutil.copytree(files_dir, task_dir / "files", dirs_exist_ok=True)
+            results[target_id] = {
+                "status": state.get("status"),
+                "result_text": result_text,
+                "changed_files": list(state.get("changed_files") or []),
+                "commits": list(state.get("commits") or []),
+                "error": state.get("error"),
+                "attempts": state.get("attempts") or 0,
+            }
+        self._write_json(hiveling / "results.json", results)
+
+        pairs: list[tuple[str, Path]] = []
+        for path in sorted(hiveling.rglob("*")):
+            if path.is_file():
+                pairs.append((path.relative_to(root).as_posix(), path))
+        return pairs
+
+    @staticmethod
+    def _write_json(path: Path, payload: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+    def _handle_gate_rejection(self, task: Task, result: TaskResult) -> list[str] | None:
+        """Reset the analysed tasks and the gate, or exhaust the attempts.
+
+        Returns the task ids to drop from ``results`` so they are dispatched
+        again, or ``None`` when ``max_attempts`` is reached (the gate fails).
+        """
+        attempt = self._gate_attempts.get(task.id, 0) + 1
+        max_attempts = task.gate_max_attempts or 1
+        if attempt >= max_attempts:
+            self._store_task(
+                task.id,
+                status="failed",
+                gate_attempt=attempt,
+                gate_verdict="INVALID",
+                error=f"gate rejected after {attempt} attempt(s): "
+                + self._one_line(result.text),
+            )
+            self._log(
+                f"[red]gate {task.id} rejected after {attempt} attempt(s)[/]"
+            )
+            return None
+
+        self._gate_attempts[task.id] = attempt
+        state = self.run_store.read(self.run_id) if self.run_store is not None else None
+        by_id = {t.get("id"): t for t in (state or {}).get("tasks", [])}
+        if result.history_rel:
+            self._archive_attempt(self.history.root / result.history_rel, attempt)
+        for target_id in task.gate_targets:
+            self._gate_feedback[target_id] = result.text
+            previous = by_id.get(target_id, {})
+            if previous.get("history_rel"):
+                self._archive_attempt(
+                    self.history.root / previous["history_rel"], attempt
+                )
+            self._store_task(
+                target_id,
+                status="pending",
+                error=None,
+                last_error=previous.get("error"),
+                skip_reason=None,
+                worker=None,
+                worker_url=None,
+                job_id=None,
+                duration_s=None,
+                history_rel=None,
+                changed_files=[],
+                commits=[],
+                artifacts=[],
+                merge={},
+                attempts=(previous.get("attempts") or 0) + 1,
+                gate_feedback=result.text,
+            )
+        self._store_task(
+            task.id,
+            status="pending",
+            error=None,
+            skip_reason=None,
+            worker=None,
+            worker_url=None,
+            job_id=None,
+            duration_s=None,
+            changed_files=[],
+            commits=[],
+            artifacts=[],
+            merge={},
+            gate_attempt=attempt,
+            gate_feedback=result.text,
+            gate_verdict="INVALID",
+        )
+        self._log(
+            f"[yellow]gate[/] {task.id} [dim]rejected (attempt {attempt}/"
+            f"{max_attempts}); re-running {', '.join(task.gate_targets)}[/]"
+        )
+        return list(task.gate_targets) + [task.id]
+
+    @staticmethod
+    def _archive_attempt(directory: Path, attempt: int) -> None:
+        if not directory.is_dir():
+            return
+        archive = directory / f"attempt-{attempt}"
+        try:
+            archive.mkdir(parents=True, exist_ok=True)
+            for name in ("status.json", "result.txt"):
+                source = directory / name
+                if source.is_file():
+                    (archive / name).write_bytes(source.read_bytes())
+        except OSError:
+            logger.debug("could not archive attempt %s in %s", attempt, directory)
+
+    @staticmethod
+    def _one_line(text: str, limit: int = 300) -> str:
+        collapsed = " ".join((text or "").split())
+        return collapsed[:limit]
 
     # --------------------------------------------------------------- display
     def _display(self, path: Path) -> str:

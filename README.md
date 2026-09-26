@@ -21,6 +21,9 @@ V1 characteristics:
 - Fail fast: a failed task stops new dispatches, but the tasks already running
   are allowed to finish before the run is finalized (and `wait_for_run`
   returns).
+- Optional **gates**: a read-only checkpoint that judges the tasks it analyses
+  and, when they are not `VALID`, resets and re-runs them (bounded), so a review
+  actually gates the next work item. See [Gates](#gates-bounded-rework).
 - Workers are configured once in `.data/workers.yaml`; the list is reloaded
   automatically when the file changes, so adding a worker needs no restart.
 - Tasks can declare **requirements** (matched against worker capabilities) and
@@ -473,6 +476,49 @@ an integration task that fans several branches in:
 
 Absolute paths (`git.path`, `path.path`, `opencode` sources) must live under the
 worker's `path_roots`; relative paths resolve under the job workspace.
+
+### Gates (bounded rework)
+
+A **gate** is an optional, read-only checkpoint over one or more tasks. It runs
+after those tasks succeed and answers with a standalone `VALID` line, or with
+the corrections it requires. Without `VALID`, the analysed tasks and the gate
+are reset and re-run; after `max_attempts` (default 20) the gate fails and the
+run stops (fail-fast). This is how a review becomes a *gate* instead of
+decoration: the plan cannot proceed to the gate's consumers until it passes.
+
+```yaml
+tasks:
+  - id: designer
+    prompt: "Produce docs/ui-design.md and commit."
+    resources: [{type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
+                 ref: main, branch: "hiveling/{run}/{task}", publish: push}}]
+  - id: coder                          # consumes the approved design
+    prompt: "Implement docs/ui-design.md."
+    depends_on: [designer-gate]        # depend on the GATE, not on designer
+    resources: [{type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
+                 ref: "hiveling/{run}/designer", publish: push}}]
+
+gates:
+  - id: designer-gate
+    tasks: [designer]
+    prompt: "Reject if the design contradicts itself or leaves the implementer guessing."
+    max_attempts: 5
+```
+
+The **server owns the gate agent** (`hiveling-gate`, injected per job with a
+locked read-only permission profile); the plan only supplies the criteria, never
+an `agent`. The gate runs on a worker with **no repository**, so it judges from
+the decision material the server uploads under `./_hiveling/`: the plan, and for
+every analysed task its status, result text, changed files, commits and the
+**files it downloaded** (`tasks/<id>/files/`). To be judged on its content, an
+analysed task must therefore download its deliverable (`download: modified` or
+`all`). The gate's own answer is in `result_text` (`run.json` → `gate_verdict`,
+`gate_attempt`).
+
+Two plan-validation rules apply: a task belongs to at most one gate, and every
+consumer of a gated task **must depend on the gate** (not on the task directly).
+Live edits and `resume_run` keep working; a gate that is reset by a rejection
+gets the same bounded treatment.
 
 ### OpenCode config injection
 

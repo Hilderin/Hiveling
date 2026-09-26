@@ -8,15 +8,15 @@ agents' own instructions stay generic.
 | Agent | Phase | Mode | Output contract |
 | --- | --- | --- | --- |
 | `analyst` | analysis | primary | scope / acceptance / decomposition / risks; ends with `ANALYSIS: READY` or `ANALYSIS: BLOCKED: …` |
-| `analyst-reviewer` | analysis review | subagent (read-only) | findings + `VERDICT: APPROVED` / `VERDICT: CHANGES_REQUESTED: …` |
+| `analyst-reviewer` | analysis review | subagent (writes a report) | `docs/reviews/analysis-review.md` + `VERDICT:` line |
 | `architect` | design | primary | interfaces, data model, files, decisions, test seams, risks |
-| `architect-reviewer` | design review | subagent (read-only) | findings + `VERDICT: …` |
+| `architect-reviewer` | design review | subagent (writes a report) | `docs/reviews/design-review.md` + `VERDICT:` line |
 | `designer` | UX/UI design | all | screens, flows, states, copy, layout, accessibility |
-| `designer-reviewer` | design review | subagent (read-only) | findings + `VERDICT: …` |
+| `designer-reviewer` | design review | subagent (writes a report) | `docs/reviews/ui-design-review.md` + `VERDICT:` line |
 | `coder` | implementation | primary | the change, verified with the project's own test command |
 | `tester` | tests | all | automated tests, green suite |
-| `reviewer` | code review | all (read-only) | findings + `VERDICT: …` |
-| `product-owner` | final acceptance | all (read-only) | each criterion PASS/FAIL/UNVERIFIED + `VERDICT: APPROVED` / `VERDICT: REJECTED: …` |
+| `reviewer` | code review | all (writes a report) | `docs/reviews/code-review.md` + `VERDICT:` line |
+| `product-owner` | final acceptance | all (writes a report) | `docs/reviews/acceptance-review.md`: per-criterion PASS/FAIL/UNVERIFIED + `VERDICT:` line |
 
 ## How to use them
 
@@ -37,46 +37,43 @@ it needs in the prompt. A generic shape:
 
 ```yaml
 tasks:
-  - id: analyze        # analyst
-    agent: analyst
-    prompt: "Requirement: <the ticket>. Produce the analysis."
-  - id: review-analysis   # analyst-reviewer
-    agent: analyst-reviewer
-    depends_on: [analyze]
-    prompt: "Review the analysis for requirement <ticket>."
-  - id: design         # architect
+  - id: design
     agent: architect
-    depends_on: [review-analysis]
-    prompt: "Design the change for <ticket>."
-  - id: design-ui      # designer (only when a UI is involved)
-    agent: designer
+    prompt: "Produce docs/design.md and commit on the current branch."
+    resources: [{type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
+                 ref: main, branch: "hiveling/{run}/{task}", publish: push}}]
+
+  - id: design-review
+    agent: architect-reviewer
     depends_on: [design]
-    prompt: "Design the UI for <ticket>."
-  - id: review-ui      # designer-reviewer
-    agent: designer-reviewer
-    depends_on: [design-ui]
-    prompt: "Review the UI design for <ticket>."
-  - id: implement      # coder (one or more parallel tasks)
+    prompt: "Review docs/design.md; write docs/reviews/design-review.md and commit it."
+    resources: [{type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
+                 ref: "hiveling/{run}/design", branch: "hiveling/{run}/{task}", publish: push}}]
+
+  - id: implement
     agent: coder
-    depends_on: [design, review-ui]
-    prompt: "Implement <work item>."
-  - id: test           # tester
-    agent: tester
-    depends_on: [implement]
-    prompt: "Add tests for <work item>."
-  - id: review         # reviewer
-    agent: reviewer
-    depends_on: [test]
-    prompt: "Review the change for <ticket>."
-  - id: accept         # product-owner — final gate
-    agent: product-owner
-    depends_on: [review, integrate]   # after everything is merged
-    prompt: "Accept or reject <ticket>: verify each acceptance criterion."
+    depends_on: [design-gate]        # depend on the GATE, not on design
+    prompt: "Implement docs/design.md."
+
+gates:
+  - id: design-gate
+    tasks: [design, design-review]   # a rejection re-runs the design AND its review
+    prompt: >
+      Reject if docs/design.md does not satisfy the requirements, or if
+      docs/reviews/design-review.md flags a blocker.
+    max_attempts: 5
 ```
 
-The `*-reviewer` / `reviewer` / `product-owner` agents produce a **verdict in
-their result**, not an automatic process gate: the orchestrator reads it with
-`get_task` and either accepts the phase or feeds the findings back
-(`update_run_plan` + `resume_run`). `product-owner` is the final gate and must
-run last, on the fully merged result, after every other phase. See the
-`hiveling-plan` skill for the full loop.
+Repeat that shape for each phase (analysis → design → UI design →
+implementation → acceptance), merging branches as needed. On a rejection
+**every** task in the gate's `tasks` is re-run with the gate's findings injected,
+in dependency order: the producer fixes its artifact, then the reviewer
+re-inspects the updated artifact and rewrites its report. `product-owner` runs
+last, on the fully merged result, after every other phase.
+
+The `*-reviewer` / `reviewer` agents **write a machine-readable report** to
+`docs/reviews/<phase>-review.md` (read-only on code, with a narrow `edit`
+carve-out) and end their result with a `VERDICT:` line. A verdict is **not** a
+process gate by itself — a review task is `succeeded` whatever it says. Hiveling
+enforces it with the `gates` entry, which resets and re-runs the analysed tasks
+until `VALID` (bounded). See the `hiveling-plan` skill for the full loop.

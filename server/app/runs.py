@@ -38,6 +38,7 @@ def build_task_states(plan, only: list[str] | None = None) -> list[dict]:
         states.append(
             {
                 "id": task.id,
+                "kind": getattr(task, "kind", "task"),
                 "status": "pending",
                 "model": task.model,
                 "agent": task.agent,
@@ -59,6 +60,12 @@ def build_task_states(plan, only: list[str] | None = None) -> list[dict]:
                 "commits": [],
                 "artifacts": [],
                 "merge": {},
+                # Gate-only fields (absent/zero for plain tasks).
+                "gate_targets": list(getattr(task, "gate_targets", []) or []),
+                "gate_max_attempts": getattr(task, "gate_max_attempts", 0) or 0,
+                "gate_attempt": 0,
+                "gate_feedback": None,
+                "gate_verdict": None,
             }
         )
     return states

@@ -813,6 +813,26 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
             headers={"Content-Disposition": f'attachment; filename="{task_id}.zip"'},
         )
 
+    @app.get("/api/runs/{run_id}/tasks/{task_id}/gate-input")
+    def api_gate_input(run_id: str, task_id: str) -> Response:
+        """Zip the decision material a gate read (its ``_hiveling/`` payload)."""
+        run = manager.store.read(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        directory = task_history_dir(run, task_id)
+        if directory is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        gate_dir = directory / "gate-input" / "_hiveling"
+        if not gate_dir.is_dir():
+            raise HTTPException(status_code=404, detail="no gate input for this task")
+        return Response(
+            content=zip_dir(gate_dir),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{task_id}-gate-input.zip"'
+            },
+        )
+
     # ---------------------------------------------------------------- workers
     @app.get("/api/workers")
     def api_workers() -> dict:
@@ -826,6 +846,25 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard() -> str:
+        return DASHBOARD_HTML
+
+    # Deep links: the single-page app is served on every run/task/gate route so
+    # a task or gate opens on its own page (not inline under the plan) and the
+    # URL stays shareable.
+    @app.get("/history", response_class=HTMLResponse)
+    def history_page() -> str:
+        return DASHBOARD_HTML
+
+    @app.get("/run/{run_id}", response_class=HTMLResponse)
+    def run_page(run_id: str) -> str:
+        return DASHBOARD_HTML
+
+    @app.get("/run/{run_id}/task/{task_id}", response_class=HTMLResponse)
+    def task_page(run_id: str, task_id: str) -> str:
+        return DASHBOARD_HTML
+
+    @app.get("/run/{run_id}/gate/{gate_id}", response_class=HTMLResponse)
+    def gate_page(run_id: str, gate_id: str) -> str:
         return DASHBOARD_HTML
 
     # ------------------------------------------------------------------- MCP

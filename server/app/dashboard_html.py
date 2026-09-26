@@ -14,7 +14,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <title>Hiveling dashboard</title>
 <style>
   :root { --bg:#0f1419; --panel:#171d26; --panel2:#1e2632; --border:#2a3543;
-          --fg:#dfe7ef; --muted:#8b98a8; --accent:#4da3ff;
+          --fg:#dfe7ef; --muted:#8b98a8; --accent:#4da3ff; --gate:#c792ea;
           --pending:#8b98a8; --running:#4da3ff; --succeeded:#3ecf8e;
           --failed:#ff5f56; --skipped:#e5c07b; --canceled:#e08e4d; }
   * { box-sizing:border-box; }
@@ -47,6 +47,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .skipped { background:var(--skipped); } .canceled { background:var(--canceled); }
   .badge { font-size:11px; padding:1px 6px; border-radius:10px; border:1px solid var(--border); color:var(--muted); }
   .badge.worker { border-color:var(--accent); color:var(--accent); }
+  .badge.gate { border-color:var(--gate); color:var(--gate); }
+  .taskrow.gate-node { border-left:2px solid var(--gate); }
   ul.tree { list-style:none; margin:0; padding-left:16px; }
   ul.tree > li { margin:3px 0; }
   .taskrow { display:inline-flex; align-items:center; gap:8px; padding:3px 8px; border-radius:6px; cursor:pointer;
@@ -137,16 +139,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       </div>
 
       <div class="panel">
-        <h2>Tasks</h2>
+        <h2>Tasks &amp; gates</h2>
         <div id="tree"></div>
-      </div>
-
-      <div id="task-panel" class="panel hidden">
-        <div class="row">
-          <span class="grow task-title" id="task-title"></span>
-          <a id="task-download" class="badge" href="#">Download files</a>
-        </div>
-        <div id="task-body"></div>
       </div>
 
       <div id="editor-panel" class="panel hidden">
@@ -158,6 +152,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
         <textarea id="editor-text"></textarea>
       </div>
+    </div>
+
+    <div id="task-view" class="hidden">
+      <div class="panel">
+        <div class="row">
+          <button onclick="backToRun()">&larr; Back to run</button>
+          <span class="grow task-title"><span id="task-kind" class="badge gate hidden">gate</span> <span id="task-title"></span></span>
+          <a id="task-download" class="badge" href="#">Download files</a>
+        </div>
+        <div class="muted" id="task-sub" style="margin-top:6px"></div>
+      </div>
+      <div class="panel"><div id="task-body"></div></div>
     </div>
   </main>
 </div>
@@ -280,13 +286,25 @@ async function openHistory() {
 function closeHistory() { state.view = 'run'; showView(); setUrl(); }
 
 function showView() {
-  const history = state.view === 'history';
+  const view = state.view;
+  const history = view === 'history';
+  const task = view === 'task' && !!state.taskDetail;
+  const run = !history && !task && !!state.runDetail;
   document.getElementById('history-view').classList.toggle('hidden', !history);
-  document.getElementById('run-view').classList.toggle('hidden', history || !state.runDetail);
-  document.getElementById('empty').classList.toggle('hidden', history || !!state.runDetail);
+  document.getElementById('run-view').classList.toggle('hidden', !run);
+  document.getElementById('task-view').classList.toggle('hidden', !task);
+  document.getElementById('empty').classList.toggle('hidden', history || run || task);
 }
 
 function openRun(runId) { loadRun(runId); }
+
+function backToRun() {
+  state.view = 'run';
+  state.task = null;
+  state.taskDetail = null;
+  if (state.run) loadRun(state.run);
+  else { showView(); setUrl(); }
+}
 
 async function loadRun(runId, keepTask) {
   state.run = runId;
@@ -295,20 +313,21 @@ async function loadRun(runId, keepTask) {
   if (!keepTask) {
     state.task = null; state.taskDetail = null;
     state.view = 'run';
-    document.getElementById('task-panel').classList.add('hidden');
     document.getElementById('editor-panel').classList.add('hidden');
   }
   renderActiveRuns(); renderRun(); showView(); setUrl();
-  if (state.task) await loadTask(state.task);
+  if (state.view === 'task' && state.task) await loadTask(state.task, true);
 }
 
 function renderRun() {
   const d = state.runDetail;
   document.getElementById('run-title').textContent = d.plan_name + '  (' + d.run_id + ')';
   const c = d.tasks.reduce((a,t) => (a[t.status]=(a[t.status]||0)+1, a), {});
+  const gates = d.tasks.filter(t => t.kind === 'gate').length;
   document.getElementById('run-meta').innerHTML =
     `<span class="dot ${d.status}"></span>${esc(d.status)} &middot; ` +
     Object.entries(c).map(([k,v]) => `${k}:${v}`).join(' &middot; ') +
+    ` &middot; ${d.tasks.length - gates} tasks` + (gates ? ` + ${gates} gates` : '') +
     ` &middot; started ${fmtTime(d.started_at)}` +
     (d.finished_at ? ` &middot; finished ${fmtTime(d.finished_at)}` : '') +
     (d.error ? ` &middot; <span class="failed">${esc(d.error)}</span>` : '');
@@ -332,36 +351,52 @@ function renderTree(tasks) {
     const kids = (children[id] || []).map(node).join('');
     const active = state.task === id ? 'active' : '';
     const deps = [...new Set([...(t.depends_on||[]), ...(t.inputs_from||[])])];
-    const dep = deps.length ? ` <span class="badge">&larr; ${esc(deps.join(', '))}</span>` : '';
+    const ids = deps.length ? ` <span class="badge">&larr; ${esc(deps.join(', '))}</span>` : '';
+    const isGate = t.kind === 'gate';
+    const kind = isGate ? ' <span class="badge gate">gate</span>' : '';
     const model = t.model ? ` <span class="badge" title="model">${esc(t.model)}</span>` : '';
     const worker = t.worker ? ` <span class="badge worker" title="worker">${esc(t.worker)}</span>` : '';
-    return `<li><button type="button" class="taskrow ${active}" onclick="loadTask('${id}')">
-        <span class="dot ${t.status}"></span><b>${esc(id)}</b>
-        <span class="muted">${t.status}${t.duration_s!=null?' '+fmtDur(t.duration_s):''}</span>${worker}${model}${dep}
+    const detail = isGate
+      ? `rejects ${t.gate_attempt||0}/${t.gate_max_attempts||0}`
+      : `${t.status}${t.duration_s!=null?' '+fmtDur(t.duration_s):''}`;
+    return `<li><button type="button" class="taskrow ${active} ${isGate?'gate-node':''}" onclick="loadTask('${id}')">
+        <span class="dot ${t.status}"></span><b>${esc(id)}</b>${kind}
+        <span class="muted">${detail}</span>${worker}${model}${ids}
       </button>${kids ? '<ul class="tree">' + kids + '</ul>' : ''}</li>`;
   }
   const items = (roots.length ? roots : tasks.map(t => t.id)).map(node).join('');
   return '<ul class="tree">' + items + '</ul>';
 }
 
-async function loadTask(taskId) {
+async function loadTask(taskId, keepView) {
   state.task = taskId;
   try { state.taskDetail = await api('/api/runs/' + encodeURIComponent(state.run) + '/tasks/' + encodeURIComponent(taskId)); }
   catch (e) { reportError(e.message); return; }
+  state.view = 'task';
   renderRun();
   renderTask();
+  showView();
   setUrl();
 }
 
 function renderTask() {
   const t = state.runDetail.tasks.find(x => x.id === state.task);
   const d = state.taskDetail || {};
-  document.getElementById('task-panel').classList.remove('hidden');
+  const isGate = t.kind === 'gate';
+  document.getElementById('task-kind').classList.toggle('hidden', !isGate);
   document.getElementById('task-title').innerHTML = `<span class="dot ${t.status}"></span>${esc(t.id)}`;
-  document.getElementById('task-download').href =
-    `/api/runs/${encodeURIComponent(state.run)}/tasks/${encodeURIComponent(t.id)}/files`;
+  document.getElementById('task-sub').innerHTML =
+    `${esc(t.status)}` +
+    (t.worker ? ` &middot; ${esc(t.worker)}` : '') +
+    (t.model ? ` &middot; ${esc(t.model)}` : '') +
+    (isGate ? ` &middot; rejects ${t.gate_attempt||0}/${t.gate_max_attempts||0}` : '');
+  const dl = document.getElementById('task-download');
+  dl.textContent = isGate ? 'Download decision material' : 'Download files';
+  dl.href = `/api/runs/${encodeURIComponent(state.run)}/tasks/${encodeURIComponent(t.id)}/` +
+    (isGate ? 'gate-input' : 'files');
   const s = d.status || {};
   const rows = [
+    ['kind', t.kind || 'task'],
     ['status', `${t.status}${s.exit_code!=null?' (exit '+s.exit_code+')':''}`],
     ['worker', t.worker || '-'],
     ['job id', t.job_id || '-'],
@@ -374,7 +409,14 @@ function renderTask() {
     ['depends on', (t.depends_on||[]).join(', ') || '-'],
     ['inputs from', (t.inputs_from||[]).join(', ') || '-'],
   ];
+  if (isGate) {
+    rows.push(['analyses', (t.gate_targets||[]).join(', ') || '-']);
+    rows.push(['rejections', `${t.gate_attempt||0} of ${t.gate_max_attempts||0} allowed`]);
+    rows.push(['verdict', t.gate_verdict || (t.status === 'succeeded' ? 'VALID' : '-')]);
+  }
   let html = '<table>' + rows.map(([k,v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join('') + '</table>';
+  if (isGate && t.gate_feedback)
+    html += `<p><b>last rejection</b><pre>${esc(t.gate_feedback)}</pre></p>`;
   if (d.request && d.request.prompt)
     html += `<p><b>prompt</b><pre>${esc(d.request.prompt)}</pre></p>`;
   if (s.tool_calls && s.tool_calls.length)
@@ -428,23 +470,41 @@ async function savePlan() {
 }
 
 function setUrl() {
-  const p = new URLSearchParams();
-  if (state.view === 'history') p.set('view', 'history');
-  else if (state.run) p.set('run', state.run);
-  if (state.view === 'run' && state.task) p.set('task', state.task);
-  history.replaceState(null, '', p.toString() ? '?' + p.toString() : location.pathname);
+  let path = '/';
+  if (state.view === 'history') {
+    path = '/history';
+  } else if (state.view === 'task' && state.run && state.task) {
+    const t = state.runDetail && state.runDetail.tasks.find(x => x.id === state.task);
+    const seg = (t && t.kind === 'gate') ? 'gate' : 'task';
+    path = `/run/${encodeURIComponent(state.run)}/${seg}/${encodeURIComponent(state.task)}`;
+  } else if (state.run) {
+    path = `/run/${encodeURIComponent(state.run)}`;
+  }
+  if (location.pathname + location.search !== path) history.replaceState(null, '', path);
+}
+
+async function route() {
+  const parts = location.pathname.split('/').filter(Boolean);
+  if (parts[0] === 'history') { await openHistory(); return; }
+  if (parts[0] === 'run' && parts[1]) {
+    const runId = decodeURIComponent(parts[1]);
+    if (parts[2] && parts[3]) {
+      await loadRun(runId, true);
+      await loadTask(decodeURIComponent(parts[3]));
+    } else {
+      await loadRun(runId);
+    }
+    return;
+  }
+  state.view = 'run';
+  showView();
+  setUrl();
 }
 
 (async function init() {
   try {
     await refresh();
-    const params = new URLSearchParams(location.search);
-    if (params.get('view') === 'history') {
-      await openHistory();
-    } else if (params.get('run')) {
-      await loadRun(params.get('run'));
-      if (params.get('task')) await loadTask(params.get('task'));
-    }
+    await route();
   } catch (e) { reportError('init: ' + e.message); }
 })();
 setInterval(refresh, 2000);

@@ -64,6 +64,7 @@ def plan_summary(path: Path, base_dir: Path | None = None) -> dict:
             "tasks": [
                 {
                     "id": t.id,
+                    "kind": getattr(t, "kind", "task"),
                     "depends_on": t.depends_on,
                     "inputs_from": t.inputs_from,
                     "model": t.model,
