@@ -57,6 +57,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="seconds between heartbeat log lines; 0 disables (default: 60)",
     )
     parser.add_argument(
+        "--keep-alive",
+        type=int,
+        default=int(os.environ.get("HIVELING_KEEP_ALIVE", "300")),
+        help="uvicorn keep-alive timeout in seconds; long MCP calls like "
+        "wait_for_run need this to exceed the wait (default: 300)",
+    )
+    parser.add_argument(
         "--mcp-token",
         default=os.environ.get("HIVELING_TOKEN"),
         help="bearer token required on /mcp (default: $HIVELING_TOKEN; empty disables auth)",
@@ -126,6 +133,7 @@ def main(argv: list[str] | None = None) -> None:
             port=args.port,
             log_level=args.log_level,
             log_config=None,
+            timeout_keep_alive=args.keep_alive,
         )
     except BaseException:
         logger.exception("server crashed with an unhandled exception")

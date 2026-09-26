@@ -126,6 +126,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <span class="grow task-title" id="run-title"></span>
           <button id="edit-plan-btn" onclick="openEditor()">Edit plan</button>
           <button id="cancel-btn" class="danger" onclick="cancelRun()">Cancel run</button>
+          <button id="resume-btn" onclick="resumeRun()">Resume run</button>
           <button onclick="refresh(true)">Refresh</button>
         </div>
         <div class="muted" id="run-meta" style="margin-top:6px"></div>
@@ -139,7 +140,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div id="task-panel" class="panel hidden">
         <div class="row">
           <span class="grow task-title" id="task-title"></span>
-          <button onclick="retryTask()">Retry task</button>
           <a id="task-download" class="badge" href="#">Download files</a>
         </div>
         <div id="task-body"></div>
@@ -385,13 +385,11 @@ async function cancelRun() {
   await refresh(true);
 }
 
-async function retryTask() {
-  if (!state.run || !state.task) return;
-  try {
-    const res = await api(`/api/runs/${encodeURIComponent(state.run)}/tasks/${encodeURIComponent(state.task)}/retry`, { method:'POST' });
-    await refresh(true);
-    await loadRun(res.run_id);
-  } catch (e) { reportError(e.message); }
+async function resumeRun() {
+  if (!state.run) return;
+  try { await api('/api/runs/' + encodeURIComponent(state.run) + '/resume', { method:'POST' }); }
+  catch (e) { reportError(e.message); }
+  await refresh(true);
 }
 
 async function openEditor() {

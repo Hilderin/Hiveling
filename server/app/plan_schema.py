@@ -120,8 +120,8 @@ Notes:
 - Tasks are topologically sorted by the server; declare them in a sensible order.
 - `download: modified` (default) downloads files the task changed/added,
   `all` downloads the whole working directory, `none` downloads nothing.
-- To run one task in isolation (e.g. a retry), the `run_plan` tool accepts an
-  `only` list, and `retry_task` re-runs a single task from a previous run.
+- A run stops at the first failed task (fail fast); `resume_run` re-arms it and
+  re-runs the failed/skipped tasks after an adjustment.
 """
 
 PLAN_EXAMPLE = """\

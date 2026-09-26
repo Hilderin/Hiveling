@@ -116,9 +116,6 @@ Useful flags:
 # show the plan order without executing it
 ./.venv/bin/python server/run.py examples/demo.yaml --dry-run
 
-# keep running other tasks after a failure
-./.venv/bin/python server/run.py examples/demo.yaml --keep-going
-
 # run a single task
 ./.venv/bin/python server/run.py examples/demo.yaml --only hello
 ```
@@ -152,15 +149,16 @@ Deep links: `?run=<run_id>`, `?run=<run_id>&task=<task_id>`, `?view=history`.
 API:
 
 - `POST /api/runs` — start a run. JSON `{"plan": "demo.yaml"}` for an existing
-  plan, or `{"plan_yaml": "<content>", "name": "optional.yaml", "only": [...],
-  "keep_going": true}`; a raw YAML body (`Content-Type: application/x-yaml`) is
-  also accepted. Pushed plans are stored in `.data/plans/`, which is also the
-  dashboard's default plan directory (`--plans-dir`). Example plans live in
-  `examples/` and are meant for the CLI or as starting points.
+  plan, or `{"plan_yaml": "<content>", "name": "optional.yaml", "only": [...]}`;
+  a raw YAML body (`Content-Type: application/x-yaml`) is also accepted. Pushed
+  plans are stored in `.data/plans/`, which is also the dashboard's default plan
+  directory (`--plans-dir`). Example plans live in `examples/` and are meant for
+  the CLI or as starting points.
 - `GET /api/runs?status=active|all&q=<search>&limit=&offset=` — paginated runs.
 - `GET /api/runs/{id}`, `POST /api/runs/{id}/cancel`,
+  `POST /api/runs/{id}/resume`,
+  `GET /api/runs/{id}/wait?timeout_s=&until=` (long-poll run state),
   `POST /api/runs/{id}/tasks/{task}/cancel`,
-  `POST /api/runs/{id}/tasks/{task}/retry`,
   `GET /api/runs/{id}/tasks/{task}`,
   `GET /api/runs/{id}/tasks/{task}/files`,
   `GET|PUT /api/runs/{id}/plan`, `GET /api/workers`.
@@ -184,17 +182,44 @@ OpenCode ──MCP/HTTP──▶ http://127.0.0.1:8080/mcp ──▶ RunManager 
 | `get_plan_schema` | full `plan.yaml` reference plus a canonical example |
 | `create_plan` | create a plan from a **structured** plan object (typed input schema) |
 | `run_plan` | start a run from a plan name or inline YAML; returns `run_id` immediately |
+| `wait_for_run` | block until a run finishes (`terminal`) or changes; returns the state and the wake reason |
 | `list_runs` | paginated runs with search and status filter |
 | `get_run` | run status plus every task state (poll this) |
 | `get_task` | one task's status, result, error and changed files |
 | `cancel_run` | cancel a whole run (running task + all pending tasks) |
 | `cancel_task` | cancel one task: stop it if running, or skip it if pending; the run continues |
-| `retry_task` | re-run a single task (new run with `only=[task]`) |
+| `resume_run` | re-run the failed/skipped tasks of a finished run and continue it |
 | `list_workers` | reachable/busy state of the workers from `workers.yaml` |
 
 `update_run_plan` edits a run's plan live (see
 [Persistence, recovery and live edits](#persistence-recovery-and-live-edits));
 `update_plan` edits a stored plan for future runs.
+
+### Agentic loop
+
+A run is **fail fast**: it stops at the first failed task and marks every task
+that had not run yet as `skipped` with `skip_reason: run_stopped`. This gives an
+orchestrator a clean, explicit decision point instead of a half-finished plan.
+`resume_run` re-arms a finished run: its `failed` and `skipped` tasks (still in
+the plan) are reset to `pending` — the previous error is kept in `last_error`
+and `status.json`/`result.txt` are archived under
+`history/<task>/<run>/attempt-N/` — and the run continues from where it stopped.
+
+A minimal orchestrator loop over MCP:
+
+```
+run_plan(plan) -> run_id
+while True:
+    ev = wait_for_run(run_id, until="terminal")
+    if ev.status == "succeeded": break
+    reason = get_task(run_id, worst_task)       # ev.run.tasks already tells you which
+    if decision == "adjust": update_run_plan(run_id, new_yaml)
+    if decision == "retry":  resume_run(run_id)
+    if decision == "abort":  cancel_run(run_id); break
+```
+
+`wait_for_run` bounds its wait with `timeout_s` and returns the current state
+with `timed_out=true` on expiry, so the loop stays responsive.
 
 ### Teaching the plan format
 
@@ -216,11 +241,12 @@ The server `instructions` also tell the model to call `get_plan_schema` before
 authoring a plan. `update_plan` remains available for raw YAML.
 
 `run_plan` is non-blocking: it starts the run and returns a `run_id`
-immediately, and you poll `get_run`/`get_task` for progress. Cancellation is
-per task or per run: `cancel_task` stops the task's worker job (or skips a
-pending task) and the run continues — dependent tasks are skipped — while
-`cancel_run` stops everything. `update_run_plan` edits a run's plan live;
-`update_plan` edits a stored plan for future runs.
+immediately. `wait_for_run` blocks until it finishes (or changes), which is how
+an agent waits instead of polling `get_run`/`get_task`. Cancellation is per task
+or per run: `cancel_task` stops the task's worker job (or skips a pending task)
+and the run continues — dependent tasks are skipped — while `cancel_run` stops
+everything. `update_run_plan` edits a run's plan live; `update_plan` edits a
+stored plan for future runs.
 
 ### Configure OpenCode
 

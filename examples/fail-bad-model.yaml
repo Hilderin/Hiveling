@@ -1,8 +1,8 @@
 version: 1
 
 # Failure handling test: the first task fails (invalid model), the second
-# depends on it and must be skipped, the third has no dependency and should
-# run when --keep-going is used.
+# depends on it and must be skipped, the third has no dependency but the run
+# stops at the first failure (fail fast), so it is skipped too.
 
 defaults:
   model: opencode-go/deepseek-v4.1-flash

@@ -52,7 +52,6 @@ class Orchestrator:
         *,
         history_dir: Path,
         poll_interval: float = 2.0,
-        keep_going: bool = False,
         worker_wait_timeout: float = 1800.0,
         console: Console | None = None,
         dry_run: bool = False,
@@ -66,6 +65,7 @@ class Orchestrator:
         workers: list[WorkerEndpoint] | None = None,
         workers_provider: Callable[[], list[WorkerEndpoint]] | None = None,
         task_cancel_provider: Callable[[str], bool] | None = None,
+        on_state_change: Callable[[], None] | None = None,
         plan_path: Path | None = None,
         plan_base_dir: Path | None = None,
         plan_snapshot: Path | None = None,
@@ -77,7 +77,6 @@ class Orchestrator:
         self.plan = plan
         self.history = History(history_dir)
         self.poll_interval = poll_interval
-        self.keep_going = keep_going
         self.worker_wait_timeout = worker_wait_timeout
         self.console = console or Console()
         self.dry_run = dry_run
@@ -91,6 +90,7 @@ class Orchestrator:
         self.workers = list(workers or [])
         self.workers_provider = workers_provider
         self.task_cancel_provider = task_cancel_provider
+        self.on_state_change = on_state_change
         # Live plan editing: the run reads this file between tasks.
         self.plan_path = Path(plan_path) if plan_path else plan.path
         self.plan_base_dir = Path(plan_base_dir) if plan_base_dir else plan.base_dir
@@ -126,6 +126,15 @@ class Orchestrator:
     def _store_task(self, task_id: str, **fields) -> None:
         if self.run_store is not None:
             self.run_store.update_task(self.run_id, task_id, **fields)
+            self._touch()
+
+    def _touch(self) -> None:
+        """Signal a state change to waiters (see RunManager.wait_for_run)."""
+        if self.on_state_change is not None:
+            try:
+                self.on_state_change()
+            except Exception:
+                logger.debug("run %s: state listener failed", self.run_id, exc_info=True)
 
     def run(self) -> int:
         self._log(
@@ -142,7 +151,6 @@ class Orchestrator:
                 plan_path=str(self.plan.path),
                 plan_name=self.plan.path.name,
                 only=sorted(self.only) if self.only else None,
-                keep_going=self.keep_going,
                 tasks=build_task_states(self.plan, sorted(self.only) if self.only else None),
                 inputs_run_id=self.inputs_run_id,
                 plan_snapshot=str(self.plan_snapshot) if self.plan_snapshot else None,
@@ -178,11 +186,7 @@ class Orchestrator:
 
                 if self._is_canceled():
                     canceled = True
-                    for remaining in tasks:
-                        if remaining.id in results:
-                            continue
-                        results[remaining.id] = "canceled"
-                        self._store_task(remaining.id, status="canceled", error="canceled by user")
+                    self._cancel_remaining(tasks, results)
                     logger.warning("run %s: canceled by user", self.run_id)
                     break
 
@@ -214,6 +218,7 @@ class Orchestrator:
                     self._store_task(
                         task.id,
                         status="skipped",
+                        skip_reason="dependency",
                         error=f"unsatisfied dependencies: {', '.join(failed_deps)}",
                     )
                     continue
@@ -221,18 +226,27 @@ class Orchestrator:
                 result = self._run_task(task)
                 results[task.id] = result.status
                 logger.info("run %s: task %s -> %s", self.run_id, task.id, result.status)
+
                 if result.status == "canceled" and self._is_canceled():
+                    # The run was canceled while this task was running.
                     canceled = True
-                stop_run = result.status != "succeeded" and not self.keep_going
-                if result.status == "canceled" and not self._is_canceled():
-                    # A single task was canceled with cancel_task: the run continues.
-                    stop_run = False
-                if stop_run:
-                    if result.status == "canceled":
-                        self._log("[yellow]run canceled[/]")
-                    else:
-                        self._log("[red]stopping after failure[/] (use --keep-going to continue)")
+                    self._cancel_remaining(tasks, results)
                     break
+                if result.status == "failed":
+                    # Fail fast: a failure always needs an orchestrator to
+                    # analyze and adjust before anything else runs.
+                    self._log("[red]task failed, stopping run[/]")
+                    logger.warning(
+                        "run %s: task %s failed, stopping run", self.run_id, task.id
+                    )
+                    self._skip_remaining(
+                        tasks,
+                        results,
+                        reason="run_stopped",
+                        message=f"run stopped after {task.id} failed",
+                    )
+                    break
+                # A task canceled with cancel_task does not stop the run.
         finally:
             self._close_clients()
 
@@ -241,6 +255,7 @@ class Orchestrator:
         status = self._final_status(results, canceled)
         if self.run_store is not None:
             self.run_store.update(self.run_id, status=status, finished_at=time.time())
+            self._touch()
         logger.info(
             "run %s: finished status=%s results=%s", self.run_id, status, results
         )
@@ -297,13 +312,33 @@ class Orchestrator:
         removed: list[str] = []
         for task in run.get("tasks", []):
             if task.get("id") not in new_states and task.get("status") == "pending":
-                task["status"] = "canceled"
+                task["status"] = "skipped"
+                task["skip_reason"] = "removed"
                 task["error"] = "removed from plan"
                 removed.append(task["id"])
 
         if added or removed:
             self.run_store.write(run)
+            self._touch()
         return added, removed
+
+    def _cancel_remaining(self, tasks: list[Task], results: dict[str, str]) -> None:
+        for remaining in tasks:
+            if remaining.id in results:
+                continue
+            results[remaining.id] = "canceled"
+            self._store_task(remaining.id, status="canceled", error="canceled by user")
+
+    def _skip_remaining(
+        self, tasks: list[Task], results: dict[str, str], *, reason: str, message: str
+    ) -> None:
+        for remaining in tasks:
+            if remaining.id in results:
+                continue
+            results[remaining.id] = "skipped"
+            self._store_task(
+                remaining.id, status="skipped", skip_reason=reason, error=message
+            )
 
     def _cancel_pending_tasks(self) -> None:
         if self.run_store is None:

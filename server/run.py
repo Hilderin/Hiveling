@@ -2,7 +2,6 @@
 
 Usage:
     python server/run.py examples/demo.yaml
-    python server/run.py examples/demo.yaml --keep-going
 """
 
 from __future__ import annotations
@@ -60,11 +59,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="max time (s) to wait for a free worker (default: 1800)",
     )
     parser.add_argument(
-        "--keep-going",
-        action="store_true",
-        help="keep running remaining tasks after a failure",
-    )
-    parser.add_argument(
         "--only",
         action="append",
         default=None,
@@ -119,7 +113,6 @@ def main(argv: list[str] | None = None) -> int:
         plan,
         history_dir=Path(args.history_dir).expanduser().resolve(),
         poll_interval=poll_interval,
-        keep_going=args.keep_going,
         worker_wait_timeout=args.worker_wait,
         console=console,
         dry_run=args.dry_run,

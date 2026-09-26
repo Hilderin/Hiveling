@@ -47,13 +47,15 @@ automatically; use list_workers to see the current workers and their health.
 Typical flow:
 1. list_plans to discover plans, or run_plan with an inline plan_yaml.
 2. run_plan returns a run_id immediately (execution is asynchronous).
-3. get_run / get_task to follow progress. Tasks end in succeeded, failed,
-   canceled or skipped.
-4. retry_task to re-run one task, cancel_run to stop a whole run, cancel_task
-   to cancel a single task (running tasks are stopped, pending tasks never run,
-   and the run continues).
-5. get_plan / update_plan to inspect or edit a stored plan. To edit the plan of
-   a run (even while it runs), use get_run_plan / update_run_plan.
+3. wait_for_run(run_id) blocks until the run finishes (or use get_run / get_task
+   to follow progress). Tasks end in succeeded, failed, canceled or skipped.
+4. A run stops at the first failed task (fail fast): the remaining tasks are
+   marked skipped. Analyse the failure, adjust with update_run_plan if needed,
+   then resume_run to re-run the failed and skipped tasks and continue the run.
+5. cancel_run stops a whole run, cancel_task cancels a single task (running
+   tasks are stopped, pending tasks never run, and the run continues).
+6. get_plan / update_plan inspect or edit a stored plan. To edit the plan of a
+   run (even while it runs), use get_run_plan / update_run_plan.
 
 A run is sequential: tasks are dispatched to the first free worker in plan
 order, and a task whose dependencies did not succeed is skipped.
@@ -86,17 +88,11 @@ def create_mcp_server(manager, config) -> MCPServer:
         plan_path: Path,
         *,
         only: list[str] | None = None,
-        keep_going: bool = False,
-        inputs_run_id: str | None = None,
-        assume_deps_ok: bool = False,
     ) -> str:
         try:
             return manager.start(
                 plan_path,
                 only=only or None,
-                keep_going=keep_going,
-                inputs_run_id=inputs_run_id,
-                assume_deps_ok=assume_deps_ok,
             )
         except PlanError as exc:
             raise ToolError(str(exc)) from exc
@@ -146,8 +142,7 @@ def create_mcp_server(manager, config) -> MCPServer:
         """Replace a stored plan with new YAML content.
 
         The content is validated before being written. Editing a plan does not
-        affect a run already in flight: it applies to the next run, and to
-        retry_task, which re-reads the plan file.
+        affect a run already in flight: it applies to the next run.
         """
         try:
             path = resolve_known_plan(config.plans_dir, name)
@@ -261,14 +256,13 @@ def create_mcp_server(manager, config) -> MCPServer:
         plan_yaml: str | None = None,
         name: str | None = None,
         only: list[str] | None = None,
-        keep_going: bool = False,
     ) -> dict[str, Any]:
         """Start a plan. Returns a run_id immediately (execution is asynchronous).
 
         Provide either ``plan`` (a name from list_plans) or ``plan_yaml`` (raw
         YAML; optional ``name`` to store it). ``only`` restricts execution to
-        the listed task ids. ``keep_going`` continues after a task failure.
-        Poll get_run with the returned run_id to follow progress.
+        the listed task ids. Execution stops at the first failed task; use
+        wait_for_run then resume_run to continue after an adjustment.
 
         For the YAML format call get_plan_schema; to author a new plan prefer
         create_plan, then run it by name.
@@ -288,7 +282,7 @@ def create_mcp_server(manager, config) -> MCPServer:
         else:
             raise ToolError("provide 'plan' (a name from list_plans) or 'plan_yaml'")
 
-        run_id = start_run(plan_path, only=only, keep_going=keep_going)
+        run_id = start_run(plan_path, only=only)
         return {"run_id": run_id, "plan_path": str(plan_path), "status": "started"}
 
     @mcp.tool()
@@ -384,28 +378,36 @@ def create_mcp_server(manager, config) -> MCPServer:
             raise ToolError(f"cannot cancel task {task_id} in run {run_id}: {result.get('reason')}")
         return {"run_id": run_id, "task_id": task_id, "status": "canceled"}
 
+    # ------------------------------------------------------------ waiting
     @mcp.tool()
-    def retry_task(run_id: str, task_id: str) -> dict[str, Any]:
-        """Re-run a single task from a run's plan.
+    def wait_for_run(run_id: str, timeout_s: float = 600.0, until: str = "terminal") -> dict[str, Any]:
+        """Block until a run finishes (or changes), then return its state.
 
-        Starts a new run containing only that task, reusing the previous run's
-        downloaded files and assuming its dependencies are satisfied. The plan
-        file is re-read, so plan edits are picked up.
+        ``until="terminal"`` (default) returns when the run reaches succeeded,
+        failed or canceled. ``until="change"`` returns after any state change.
+        ``timeout_s`` bounds the wait; on timeout the current state is returned
+        with ``timed_out=true``. Use this instead of polling get_run.
         """
-        run = manager.store.read(run_id)
-        if run is None:
+        result = manager.wait_for_run(run_id, timeout_s=timeout_s, until=until)
+        if result.get("reason") == "run not found":
             raise ToolError(f"run not found: {run_id}")
-        plan_path = Path(run["plan_path"])
-        if not plan_path.is_file():
-            raise ToolError(f"plan no longer exists: {plan_path}")
-        new_id = start_run(
-            plan_path,
-            only=[task_id],
-            keep_going=True,
-            inputs_run_id=run_id,
-            assume_deps_ok=True,
-        )
-        return {"run_id": new_id, "task_id": task_id, "status": "started"}
+        if str(result.get("reason", "")).startswith("until must be"):
+            raise ToolError(result["reason"])
+        return result
+
+    @mcp.tool()
+    def resume_run(run_id: str) -> dict[str, Any]:
+        """Continue a finished run by re-running its failed and skipped tasks.
+
+        The run keeps its succeeded tasks and re-reads its plan snapshot (so
+        live edits apply), then continues from where it stopped. Use it to
+        retry after an orchestrator has adjusted the plan. The previous error is
+        preserved in each task's ``last_error``.
+        """
+        result = manager.resume_run(run_id)
+        if not result.get("ok"):
+            raise ToolError(f"cannot resume run {run_id}: {result.get('reason')}")
+        return result
 
     # ------------------------------------------------------------------ workers
     @mcp.tool()

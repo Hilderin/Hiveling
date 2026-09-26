@@ -36,7 +36,7 @@ from .plan_files import (
     write_plan,
 )
 from .readers import read_json, read_text, zip_dir
-from .runs import RunStore, new_run_id
+from .runs import TERMINAL_RUN_STATUSES, RunStore, new_run_id
 from .workers import WorkerRegistry, probe_workers
 
 logger = logging.getLogger("hiveling.server.web")
@@ -90,17 +90,23 @@ class RunManager:
         self.store = RunStore(config.runs_dir)
         self.workers = WorkerRegistry(config.workers_path)
         self._active: dict[str, dict] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        # Waiters (wait_for_run) sleep on this condition; it is notified on every
+        # run/task state change via _notify_state.
+        self._condition = threading.Condition(self._lock)
+        self._revisions: dict[str, int] = {}
         self._stop = threading.Event()
+
+    def _notify_state(self, run_id: str) -> None:
+        with self._condition:
+            self._revisions[run_id] = self._revisions.get(run_id, 0) + 1
+            self._condition.notify_all()
 
     def start(
         self,
         plan_path: Path,
         *,
         only: list[str] | None = None,
-        keep_going: bool = False,
-        inputs_run_id: str | None = None,
-        assume_deps_ok: bool = False,
     ) -> str:
         plan = load_plan(plan_path)  # raises PlanError
         run_id = new_run_id()
@@ -110,17 +116,15 @@ class RunManager:
             plan,
             history_dir=self.config.history_dir,
             poll_interval=self.config.poll_interval,
-            keep_going=keep_going,
             worker_wait_timeout=self.config.worker_wait_timeout,
             only=only,
             run_store=self.store,
             run_id=run_id,
             cancel_event=cancel_event,
-            inputs_run_id=inputs_run_id,
-            assume_deps_ok=assume_deps_ok,
             quiet=True,
             workers_provider=self.workers.get,
             task_cancel_provider=lambda task_id: self._task_cancel_requested(run_id, task_id),
+            on_state_change=lambda: self._notify_state(run_id),
             plan_path=snapshot,
             plan_base_dir=plan.base_dir,
             plan_snapshot=snapshot,
@@ -188,6 +192,7 @@ class RunManager:
             if entry is not None:
                 entry.setdefault("task_cancels", {}).setdefault(task_id, threading.Event()).set()
         self.store.update_task(run_id, task_id, status="canceled", error="canceled by user")
+        self._notify_state(run_id)
         return {"ok": True, "task_id": task_id, "status": "canceled"}
 
     def cancel(self, run_id: str) -> bool:
@@ -197,6 +202,7 @@ class RunManager:
             return False
         entry["event"].set()
         self.store.update(run_id, cancel_requested=True)
+        self._notify_state(run_id)
         logger.warning("run %s: cancel requested", run_id)
         return True
 
@@ -302,7 +308,6 @@ class RunManager:
             plan,
             history_dir=self.config.history_dir,
             poll_interval=self.config.poll_interval,
-            keep_going=bool(run.get("keep_going")),
             worker_wait_timeout=self.config.worker_wait_timeout,
             only=run.get("only") or None,
             run_store=self.store,
@@ -312,6 +317,7 @@ class RunManager:
             quiet=True,
             workers_provider=self.workers.get,
             task_cancel_provider=lambda task_id: self._task_cancel_requested(run_id, task_id),
+            on_state_change=lambda: self._notify_state(run_id),
             plan_path=plan_file,
             plan_base_dir=base_dir,
             plan_snapshot=Path(snapshot) if snapshot else plan_file,
@@ -334,6 +340,141 @@ class RunManager:
             len(initial),
         )
         thread.start()
+        self._notify_state(run_id)
+
+    # --------------------------------------------------------------- resume
+    def resume_run(self, run_id: str) -> dict:
+        """Re-arm a finished run: reset its failed and skipped tasks to pending.
+
+        The run keeps its succeeded tasks, re-reads its plan snapshot (so live
+        edits apply) and continues from where it stopped. The previous error is
+        preserved in ``last_error`` and the previous attempt's ``status.json`` /
+        ``result.txt`` are archived under the task's history directory.
+        """
+        if self.is_active(run_id):
+            return {"ok": False, "reason": "run is already running"}
+        run = self.store.read(run_id)
+        if run is None:
+            return {"ok": False, "reason": "run not found"}
+        plan_file = self.run_plan_file(run_id)
+        if plan_file is None:
+            return {"ok": False, "reason": "no plan file for this run"}
+        base_dir = run.get("base_dir") or None
+        try:
+            plan = load_plan(plan_file, base_dir=base_dir)
+        except PlanError as exc:
+            return {"ok": False, "reason": f"invalid plan: {exc}"}
+        plan_ids = {task.id for task in plan.tasks}
+
+        reset: list[str] = []
+        for task in run.get("tasks", []):
+            if task.get("id") not in plan_ids:
+                continue  # removed from the plan: nothing to re-run
+            if task.get("status") not in ("failed", "skipped"):
+                continue
+            attempt = task.get("attempts") or 0
+            self._archive_attempt(run_id, task, attempt)
+            task["last_error"] = task.get("error")
+            task["attempts"] = attempt + 1
+            task["status"] = "pending"
+            task["error"] = None
+            task["skip_reason"] = None
+            task["worker"] = None
+            task["worker_url"] = None
+            task["job_id"] = None
+            task["duration_s"] = None
+            task["changed_files"] = []
+            task["history_rel"] = None
+            reset.append(task["id"])
+
+        if not reset:
+            return {"ok": False, "reason": "no failed or skipped task to resume"}
+
+        run["status"] = "running"
+        run["error"] = None
+        run["finished_at"] = None
+        run["cancel_requested"] = False
+        run["resumed_at"] = time.time()
+        run["attempts"] = (run.get("attempts") or 1) + 1
+        self.store.write(run)
+        self._claim(run_id, run)
+        logger.warning(
+            "run %s: resume requested (reset %d task(s): %s)",
+            run_id,
+            len(reset),
+            ", ".join(reset),
+        )
+        self._resume(run)
+        return {"ok": True, "run_id": run_id, "reset": reset}
+
+    def _archive_attempt(self, run_id: str, task: dict, attempt: int) -> None:
+        rel = task.get("history_rel")
+        if not rel:
+            return
+        directory = self.config.history_dir / rel
+        if not directory.is_dir():
+            return
+        archive = directory / f"attempt-{attempt + 1}"
+        try:
+            archive.mkdir(parents=True, exist_ok=True)
+            for name in ("status.json", "result.txt"):
+                source = directory / name
+                if source.is_file():
+                    (archive / name).write_bytes(source.read_bytes())
+        except OSError:
+            logger.debug("run %s: could not archive attempt for %s", run_id, task.get("id"))
+
+    # ------------------------------------------------------------ wait
+    def wait_for_run(
+        self, run_id: str, timeout_s: float = 600.0, until: str = "terminal"
+    ) -> dict:
+        """Block until the run reaches a terminal state (default) or changes.
+
+        ``until`` is ``terminal`` (succeeded/failed/canceled) or ``change``
+        (any state change). Returns the run state plus the wake reason; on
+        timeout it returns ``{"timed_out": true}`` with the current state.
+
+        The condition is only used to *wake up* on changes; the run document is
+        always read without holding the manager lock, so the orchestrator (which
+        holds the store lock while writing then notifies) can never deadlock us.
+        """
+        if until not in ("terminal", "change"):
+            return {"ok": False, "reason": "until must be 'terminal' or 'change'"}
+        deadline = time.time() + max(0.0, timeout_s)
+        with self._condition:
+            start_rev = self._revisions.get(run_id, 0)
+
+        while True:
+            run = self.store.read(run_id)
+            if run is None:
+                return {"ok": False, "reason": "run not found"}
+            status = run.get("status")
+            if until == "terminal" and status in TERMINAL_RUN_STATUSES:
+                return {"run_id": run_id, "status": status, "event": "terminal", "run": run}
+
+            with self._condition:
+                changed = self._revisions.get(run_id, 0) != start_rev
+            if until == "change" and changed:
+                return {
+                    "run_id": run_id,
+                    "status": status,
+                    "event": "change",
+                    "run": run,
+                }
+
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return {
+                    "run_id": run_id,
+                    "status": status,
+                    "event": "timeout",
+                    "timed_out": True,
+                    "run": run,
+                }
+            # Sleep until notified (a change) or at most 1s, then re-read. This
+            # releases the lock while waiting.
+            with self._condition:
+                self._condition.wait(timeout=min(remaining, 1.0))
 
     # ----------------------------------------------------------- heartbeat
     def start_heartbeat(self) -> None:
@@ -466,7 +607,7 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
         JSON body: ``{"plan": "demo.yaml"}`` to use an existing plan file, or
         ``{"plan_yaml": "<yaml content>", "name": "optional.yaml"}`` to push a
         plan. A raw YAML body (``Content-Type: application/x-yaml``) is also
-        accepted. Optional ``only`` (list) and ``keep_going`` (bool).
+        accepted. Optional ``only`` (list).
         """
         content_type = request.headers.get("content-type", "")
         body = await request.body()
@@ -474,7 +615,6 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
         plan_yaml: str | None = None
         name: str | None = None
         only: list[str] = []
-        keep_going = False
 
         if "json" in content_type:
             try:
@@ -485,13 +625,11 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
             plan_yaml = data.get("plan_yaml")
             name = data.get("name")
             only = [str(x) for x in (data.get("only") or [])]
-            keep_going = bool(data.get("keep_going"))
         else:
             plan_name = request.query_params.get("plan")
             plan_yaml = body.decode("utf-8") if body else None
             name = request.query_params.get("name")
             only = request.query_params.getlist("only")
-            keep_going = request.query_params.get("keep_going", "").lower() in ("1", "true", "yes")
 
         if plan_yaml:
             try:
@@ -506,7 +644,7 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
             raise HTTPException(status_code=400, detail="provide 'plan' or 'plan_yaml'")
 
         try:
-            run_id = manager.start(plan_path, only=only or None, keep_going=keep_going)
+            run_id = manager.start(plan_path, only=only or None)
         except PlanError as exc:
             if plan_yaml:
                 plan_path.unlink(missing_ok=True)
@@ -527,25 +665,23 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
             raise HTTPException(status_code=404, detail="run not found")
         return {"ok": manager.cancel(run_id)}
 
-    @app.post("/api/runs/{run_id}/tasks/{task_id}/retry")
-    def api_task_retry(run_id: str, task_id: str) -> dict:
-        run = manager.store.read(run_id)
-        if run is None:
+    @app.post("/api/runs/{run_id}/resume")
+    def api_run_resume(run_id: str) -> dict:
+        result = manager.resume_run(run_id)
+        if not result.get("ok"):
+            reason = result.get("reason", "")
+            status = 404 if reason == "run not found" else 409
+            raise HTTPException(status_code=status, detail=reason)
+        return result
+
+    @app.get("/api/runs/{run_id}/wait")
+    def api_run_wait(run_id: str, timeout_s: float = 600.0, until: str = "terminal") -> dict:
+        result = manager.wait_for_run(run_id, timeout_s=timeout_s, until=until)
+        if result.get("reason") == "run not found":
             raise HTTPException(status_code=404, detail="run not found")
-        plan_path = Path(run["plan_path"])
-        if not plan_path.is_file():
-            raise HTTPException(status_code=400, detail=f"plan no longer exists: {plan_path}")
-        try:
-            new_id = manager.start(
-                plan_path,
-                only=[task_id],
-                keep_going=True,
-                inputs_run_id=run_id,
-                assume_deps_ok=True,
-            )
-        except PlanError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"run_id": new_id}
+        if result.get("reason", "").startswith("until must be"):
+            raise HTTPException(status_code=400, detail=result["reason"])
+        return result
 
     @app.post("/api/runs/{run_id}/tasks/{task_id}/cancel")
     def api_task_cancel(run_id: str, task_id: str) -> dict:
