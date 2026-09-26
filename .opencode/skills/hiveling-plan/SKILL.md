@@ -79,7 +79,8 @@ OpenCode runs from the **job workspace root**, but a git checkout usually does
   `path` that is `<workspace>/<path>`.
 
 So write prompts against the tree, e.g. *"the repository is at `./src/repo`;
-read `./src/repo/feature.md` and commit inside it"* — not "the workspace root".
+read `./src/repo/feature.md`; write the files there — do not run `git commit`,
+the worker commits and pushes for you"* — not "the workspace root".
 Point `opencode.agents_paths` / `skills_paths` / `agents_md` at the checkout
 (`./src/repo/.opencode/agents`, …), not at `./repo/...`. The worker also
 prepends a `[Working environment]` block, but do not rely on it: a wrong path in
@@ -168,7 +169,7 @@ defaults:
 tasks:
   - id: designer
     agent: designer
-    prompt: "Produce ./src/repo/docs/ui-design.md and commit on the current branch."
+    prompt: "Produce ./src/repo/docs/ui-design.md."
     resources:
       - {type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
           ref: main, branch: "hiveling/{run}/{task}", publish: push}}
@@ -245,6 +246,15 @@ Decision rules:
   `commit`). A **writer reviewer** that writes `docs/reviews/<phase>-review.md`
   does modify the tree, so it uses `publish: push`/`commit` — and needs the
   `edit` carve-out for that path, or the write is denied.
+- **Do not ask the agent to commit.** The `git` provider runs `git add -A` +
+  `git commit` + push at finalize (Python, no shell), so a prompt that says
+  "commit on the current branch" only invites the agent to fight shell quoting
+  (worst on Windows) — often by writing a message file into the OS temp dir.
+  Ask for **files**; use `with: {commit_message: "…"}` if you want a specific
+  message.
+- **Never write outside the checkout.** The workspace, not the OS temp dir, is
+  what gets committed. Scratch files must live under `./src/<id>` (the worker
+  also grants the platform temp dir by default, but nothing there is published).
 - **Permissions come from the injected config, not a flag.** There is no `auto`
   option and the worker never passes `--auto`. A task may only do what the
   effective `opencode.json` and its agent `permissions` allow.
@@ -341,6 +351,8 @@ finding if omitted:
   or a `git` resource (code).
 - Pointing prompts at the workspace root instead of the checkout: `publish: push`
   fails with "nothing to push" (or silently edits the wrong tree).
+- Asking the agent to `git commit`: unnecessary (the provider commits) and it
+  triggers shell-quoting workarounds that spill into the OS temp dir.
 - Using `publish: push` on a task that does not modify the branch: use
   `publish: none`/`commit`. A **writer reviewer** is the opposite case: it
   writes a report, so it must publish *and* have the `edit` carve-out for

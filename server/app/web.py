@@ -26,6 +26,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel
 
 from .dashboard_html import DASHBOARD_HTML
+from .history import archive_attempt
 from .mcp_server import BearerAuthMiddleware, create_mcp_server
 from .orchestrator import Orchestrator
 from .plan import PlanError, load_plan
@@ -369,8 +370,9 @@ class RunManager:
 
         The run keeps its succeeded tasks, re-reads its plan snapshot (so live
         edits apply) and continues from where it stopped. The previous error is
-        preserved in ``last_error`` and the previous attempt's ``status.json`` /
-        ``result.txt`` are archived under the task's history directory.
+        preserved in ``last_error`` and the finished attempt's evidence
+        (``status.json``, ``result.txt``, ``events.jsonl``, …) is archived under
+        ``<task history>/attempt-<n>/``.
         """
         if self.is_active(run_id):
             return {"ok": False, "reason": "run is already running"}
@@ -394,9 +396,9 @@ class RunManager:
             if task.get("status") not in ("failed", "skipped"):
                 continue
             attempt = task.get("attempts") or 0
-            self._archive_attempt(run_id, task, attempt)
+            if task.get("history_rel"):
+                archive_attempt(self.config.history_dir / task["history_rel"], attempt)
             task["last_error"] = task.get("error")
-            task["attempts"] = attempt + 1
             task["status"] = "pending"
             task["error"] = None
             task["skip_reason"] = None
@@ -427,23 +429,6 @@ class RunManager:
         )
         self._resume(run)
         return {"ok": True, "run_id": run_id, "reset": reset}
-
-    def _archive_attempt(self, run_id: str, task: dict, attempt: int) -> None:
-        rel = task.get("history_rel")
-        if not rel:
-            return
-        directory = self.config.history_dir / rel
-        if not directory.is_dir():
-            return
-        archive = directory / f"attempt-{attempt + 1}"
-        try:
-            archive.mkdir(parents=True, exist_ok=True)
-            for name in ("status.json", "result.txt"):
-                source = directory / name
-                if source.is_file():
-                    (archive / name).write_bytes(source.read_bytes())
-        except OSError:
-            logger.debug("run %s: could not archive attempt for %s", run_id, task.get("id"))
 
     # ------------------------------------------------------------ wait
     def wait_for_run(

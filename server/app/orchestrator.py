@@ -35,7 +35,7 @@ from .gate import (
     is_valid_verdict,
     with_gate_feedback,
 )
-from .history import History
+from .history import History, archive_attempt
 from .plan import Plan, PlanError, Task, WorkerEndpoint, load_plan
 from .runs import RunStore, build_task_states, new_run_id
 from .worker_client import WorkerBusy, WorkerClient, WorkerError
@@ -129,6 +129,10 @@ class Orchestrator:
         # task states and reloaded on recovery.
         self._gate_attempts: dict[str, int] = {}
         self._gate_feedback: dict[str, str] = {}
+        # In-memory mirror of each task's 1-based attempt counter. It is
+        # incremented when a task is actually dispatched (never on a busy retry),
+        # and read back when a finished attempt is archived before a re-run.
+        self._attempts: dict[str, int] = {}
         if self.run_store is not None and self.run_id:
             self._load_gate_state()
         self._plan_stamp = self._stamp(self.plan_path)
@@ -146,6 +150,13 @@ class Orchestrator:
             feedback = state.get("gate_feedback")
             if feedback:
                 self._gate_feedback[state["id"]] = feedback
+            self._attempts[state["id"]] = state.get("attempts") or 0
+
+    def _next_attempt(self, task_id: str) -> int:
+        """Reserve the next 1-based attempt number for a dispatch."""
+        attempt = self._attempts.get(task_id, 0) + 1
+        self._attempts[task_id] = attempt
+        return attempt
 
     @staticmethod
     def _stamp(path: Path) -> tuple[int, int] | None:
@@ -956,8 +967,9 @@ class Orchestrator:
                 inputs = inputs + self._feedback_inputs(task)
 
         client.create_job(spec)  # raises WorkerBusy when busy
+        attempt = self._next_attempt(task.id)
         self._store_task(task.id, status="running", worker=client.endpoint.name,
-                         worker_url=client.base_url, job_id=job_id)
+                         worker_url=client.base_url, job_id=job_id, attempts=attempt)
         logger.info(
             "run %s: task %s dispatched to %s (job %s, model %s)",
             self.run_id,
@@ -1315,14 +1327,15 @@ class Orchestrator:
         state = self.run_store.read(self.run_id) if self.run_store is not None else None
         by_id = {t.get("id"): t for t in (state or {}).get("tasks", [])}
         if result.history_rel:
-            self._archive_attempt(self.history.root / result.history_rel, attempt)
+            archive_attempt(self.history.root / result.history_rel, attempt)
         for target_id in task.gate_targets:
             self._gate_feedback[target_id] = result.text
             previous = by_id.get(target_id, {})
+            # Archive under the finished attempt's own number (not the gate's),
+            # so a resume archive and a gate archive never collide.
+            finished = previous.get("attempts") or attempt
             if previous.get("history_rel"):
-                self._archive_attempt(
-                    self.history.root / previous["history_rel"], attempt
-                )
+                archive_attempt(self.history.root / previous["history_rel"], finished)
             self._store_task(
                 target_id,
                 status="pending",
@@ -1338,7 +1351,6 @@ class Orchestrator:
                 commits=[],
                 artifacts=[],
                 merge={},
-                attempts=(previous.get("attempts") or 0) + 1,
                 gate_feedback=result.text,
             )
         self._store_task(
@@ -1363,20 +1375,6 @@ class Orchestrator:
             f"{max_attempts}); re-running {', '.join(task.gate_targets)}[/]"
         )
         return list(task.gate_targets) + [task.id]
-
-    @staticmethod
-    def _archive_attempt(directory: Path, attempt: int) -> None:
-        if not directory.is_dir():
-            return
-        archive = directory / f"attempt-{attempt}"
-        try:
-            archive.mkdir(parents=True, exist_ok=True)
-            for name in ("status.json", "result.txt"):
-                source = directory / name
-                if source.is_file():
-                    (archive / name).write_bytes(source.read_bytes())
-        except OSError:
-            logger.debug("could not archive attempt %s in %s", attempt, directory)
 
     @staticmethod
     def _one_line(text: str, limit: int = 300) -> str:

@@ -7,6 +7,9 @@ plan author rewriting Markdown bodies.
 
 Sources, lowest to highest precedence:
 
+0. a built-in default granting every agent read/write on the platform temp
+   directory (``temp_permissions``), so a scratch file under ``$TMPDIR`` /
+   ``%TEMP%`` never trips OpenCode's auto-rejected ``external_directory`` ask;
 1. the worker's baseline OpenCode bundle (``--opencode-dir``);
 2. repo/config provenance reported by the git/path providers;
 3. plan ``opencode`` sources (``from``, ``agents_paths``, ``skills_paths``,
@@ -36,7 +39,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .environment import EnvironmentError, resolve_worker_path
+from .environment import EnvironmentError, resolve_worker_path, temp_permissions
 
 logger = logging.getLogger("hiveling.worker.opencode")
 
@@ -274,7 +277,11 @@ def inject(
     report = InjectionReport()
 
     location.mkdir(parents=True, exist_ok=True)
-    config: dict = {}
+    # Lowest-priority layer: every agent may read/write the platform temp dir.
+    # OpenCode auto-rejects `ask` in a non-interactive run, so without this a
+    # scratch file under $TMPDIR/%TEMP% aborts the session. Later layers (repo,
+    # plan, agent rules) still win because `permissions` is additive.
+    config: dict = temp_permissions()
     agent_dirs: list[tuple[int, Path]] = []
     skill_dirs: list[tuple[int, Path]] = []
     agents_md: list[tuple[int, Path]] = []

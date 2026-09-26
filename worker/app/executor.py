@@ -309,30 +309,31 @@ def execute(job: Job, config: Config) -> None:
         }
 
     # Inject the OpenCode runtime config (agents, skills, AGENTS.md, permissions)
-    # at the location directory before OpenCode starts.
+    # at the location directory before OpenCode starts. This always runs: the
+    # built-in temp-directory permissions must apply to every job, even one with
+    # no resources and no plan-level `opencode` block.
     plan_opencode = job.spec.get("opencode") or {}
-    if plan_opencode or environment is not None or getattr(config, "opencode_dir", None):
-        try:
-            from .opencode_config import inject as inject_opencode
+    try:
+        from .opencode_config import inject as inject_opencode
 
-            report = inject_opencode(
-                workdir,
-                plan_opencode=plan_opencode,
-                baseline_dir=getattr(config, "opencode_dir", None),
-                provenance=environment.config_roots() if environment else [],
-                fragments=environment.opencode_fragments if environment else [],
-                ctx=ctx,
-            )
-            logger.info(
-                "job %s: opencode config injected (agents=%d skills=%d agents_md=%d)",
-                job.job_id,
-                len(report.agents),
-                len(report.skills),
-                len(report.agents_md),
-            )
-        except EnvironmentError as exc:
-            _fail_before_start(job, f"opencode config error: {exc}")
-            return
+        report = inject_opencode(
+            workdir,
+            plan_opencode=plan_opencode,
+            baseline_dir=getattr(config, "opencode_dir", None),
+            provenance=environment.config_roots() if environment else [],
+            fragments=environment.opencode_fragments if environment else [],
+            ctx=ctx,
+        )
+        logger.info(
+            "job %s: opencode config injected (agents=%d skills=%d agents_md=%d)",
+            job.job_id,
+            len(report.agents),
+            len(report.skills),
+            len(report.agents_md),
+        )
+    except EnvironmentError as exc:
+        _fail_before_start(job, f"opencode config error: {exc}")
+        return
 
     # Snapshot *after* provisioning, so a checkout/clean is not reported as a
     # change made by OpenCode.

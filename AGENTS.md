@@ -114,6 +114,7 @@ grep -a heartbeat .data/logs/worker.log | tail -1   # is the worker alive?
 | `opencode` finds no files / edits the wrong place | the prompt points at the workspace root instead of the checkout (`./src/<id>`); the worker prepends a `[Working environment]` block — read it in `events.jsonl`. |
 | `worker unreachable` after N tries | worker restarted or network; the job is lost (a worker restart fails its in-flight job). |
 | Task `failed` with `timeout after Ns` | raise `timeout_s`; check the opencode process was terminated (logs) — long prompts on Windows hit CLI length limits. |
+| Task failed, log has `permission requested: external_directory (…); auto-rejecting` | a non-interactive `opencode run` auto-rejects an `ask` permission, typically when an agent writes outside the job workspace (the OS temp dir on Windows). The worker already grants the platform temp dir by default; for other external paths declare `external_directory` rules in `opencode.config.permissions` (or the agent's own `permissions`), or make the task read-only (`publish: none`). |
 | Run stuck, no worker free | `max_parallel`/one-job-per-worker; a worker is `busy`; check `/health`. |
 | Two servers on one run | `owner` lease in `run.json`; both log recovery. Keep one. |
 | Files from `inputs_from` missing | the producer had `download: none` (nothing was zipped) or its `files/` dir is empty. |
@@ -177,7 +178,11 @@ The git provider has local bare-repo fixtures (`tests/test_git_merge.py`,
 - `run.json` task fields: `status`, `error`, `last_error`, `skip_reason`,
   `worker`, `job_id`, `history_rel`, `changed_files`, `commits`, `merge`,
   `requirements`, `attempts`.
-- Archive on retry: `history/<task>/<run>/attempt-N/`.
+- Archive on retry: `history/<task>/<run>/attempt-N/` keeps the finished
+  attempt's `status.json`, `result.txt`, `events.jsonl`, `stderr.log`,
+  `worker.json` and `request.json`. `attempts` is the 1-based number of the
+  attempt that ran; resume and gate re-arms share the same counter, so their
+  archives never collide.
 
 ## 10. Conventions when changing Hiveling
 

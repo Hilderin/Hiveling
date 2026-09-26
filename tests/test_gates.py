@@ -3,6 +3,7 @@
 import pytest
 
 from server.app.gate import build_gate_prompt, is_valid_verdict
+from server.app.history import archive_attempt
 from server.app.orchestrator import Orchestrator, TaskResult
 from server.app.plan import PlanError, load_plan
 from server.app.runs import RunStore, build_task_states
@@ -197,7 +198,7 @@ def _orchestrator(tmp_path, text):
 
 def test_gate_rejection_resets_targets_and_gate(tmp_path):
     orch, store, run_id = _orchestrator(tmp_path, BASIC)
-    orch._store_task("a", status="succeeded")
+    orch._store_task("a", status="succeeded", attempts=1)
     orch._store_task("ga", status="running")
     results = {"a": "succeeded", "ga": "running"}
     running = {"ga": (None, None)}
@@ -210,6 +211,7 @@ def test_gate_rejection_resets_targets_and_gate(tmp_path):
     run = store.read(run_id)
     states = {t["id"]: t for t in run["tasks"]}
     assert states["a"]["status"] == "pending"
+    # The finished attempt number is kept until the re-dispatch bumps it.
     assert states["a"]["attempts"] == 1
     assert states["a"]["gate_feedback"] == "fix routing"
     assert states["ga"]["status"] == "pending"
@@ -270,4 +272,58 @@ def test_gate_verdict_cleared_to_valid_after_a_rejection(tmp_path):
     assert gate["status"] == "succeeded"
     assert gate["gate_verdict"] == "VALID"
     assert gate["gate_attempt"] == 1
+
+
+# --------------------------------------------------------------- archives
+def test_archive_attempt_keeps_full_evidence(tmp_path):
+    directory = tmp_path / "history"
+    directory.mkdir()
+    (directory / "status.json").write_text('{"status": "failed"}', encoding="utf-8")
+    (directory / "result.txt").write_text("boom", encoding="utf-8")
+    (directory / "events.jsonl").write_text("{}\n", encoding="utf-8")
+    (directory / "stderr.log").write_text("err", encoding="utf-8")
+    (directory / "files.zip").write_bytes(b"zip")
+
+    archive = archive_attempt(directory, 1)
+
+    assert archive == directory / "attempt-1"
+    assert (archive / "status.json").read_text(encoding="utf-8") == '{"status": "failed"}'
+    assert (archive / "result.txt").read_text(encoding="utf-8") == "boom"
+    assert (archive / "events.jsonl").read_text(encoding="utf-8") == "{}\n"
+    assert (archive / "stderr.log").read_text(encoding="utf-8") == "err"
+    # The bulky file bundle is not duplicated.
+    assert not (archive / "files.zip").exists()
+
+
+def test_successive_attempts_do_not_collide(tmp_path):
+    directory = tmp_path / "history"
+    directory.mkdir()
+    (directory / "status.json").write_text("first", encoding="utf-8")
+    archive_attempt(directory, 1)
+    (directory / "status.json").write_text("second", encoding="utf-8")
+    archive_attempt(directory, 2)
+
+    assert (directory / "attempt-1" / "status.json").read_text(encoding="utf-8") == "first"
+    assert (directory / "attempt-2" / "status.json").read_text(encoding="utf-8") == "second"
+
+
+def test_attempt_counter_is_one_based_and_monotonic(tmp_path):
+    orch, _store, _run_id = _orchestrator(tmp_path, BASIC)
+    assert orch._next_attempt("a") == 1
+    assert orch._next_attempt("a") == 2
+    assert orch._attempts["a"] == 2
+
+
+def test_attempt_counter_reloaded_from_run_state(tmp_path):
+    orch, store, run_id = _orchestrator(tmp_path, BASIC)
+    store.update_task(run_id, "a", attempts=3)
+    reloaded = Orchestrator(
+        orch.plan,
+        history_dir=tmp_path / "history",
+        run_store=store,
+        run_id=run_id,
+        quiet=True,
+    )
+    # A resumed server continues counting from the persisted value.
+    assert reloaded._next_attempt("a") == 4
 

@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from worker.app.environment import Context, EnvironmentError
+from worker.app.environment import Context, EnvironmentError, temp_permissions
 from worker.app.opencode_config import inject
 
 
@@ -127,7 +127,50 @@ def test_provider_fragment_is_merged(tmp_path):
         ctx=c,
     )
     config = json.loads((c.workspace / "opencode.json").read_text(encoding="utf-8"))
-    assert config["permissions"][0]["resource"] == "/x/**"
+    resources = [rule["resource"] for rule in config["permissions"]]
+    assert "/x/**" in resources
+
+
+def test_temp_dir_permissions_added_by_default(tmp_path):
+    c = make_ctx(tmp_path)
+    inject(
+        c.workspace,
+        plan_opencode={},
+        baseline_dir=None,
+        provenance=[],
+        fragments=[],
+        ctx=c,
+    )
+    config = json.loads((c.workspace / "opencode.json").read_text(encoding="utf-8"))
+    temp = temp_permissions()["permissions"][0]["resource"]
+    assert temp in [rule["resource"] for rule in config["permissions"]]
+    assert any(
+        rule["action"] == "external_directory" and rule["resource"] == temp
+        for rule in config["permissions"]
+    )
+
+
+def test_temp_dir_permissions_can_be_overridden(tmp_path):
+    """A later layer wins: a plan deny after the built-in allow is preserved."""
+    c = make_ctx(tmp_path)
+    temp = temp_permissions()["permissions"][0]["resource"]
+    inject(
+        c.workspace,
+        plan_opencode={
+            "config": {
+                "permissions": [
+                    {"action": "external_directory", "resource": temp, "effect": "deny"}
+                ]
+            }
+        },
+        baseline_dir=None,
+        provenance=[],
+        fragments=[],
+        ctx=c,
+    )
+    config = json.loads((c.workspace / "opencode.json").read_text(encoding="utf-8"))
+    matching = [r for r in config["permissions"] if r["resource"] == temp]
+    assert matching[-1]["effect"] == "deny"
 
 
 def test_repo_config_overrides_baseline_and_plan_overrides_repo(tmp_path):

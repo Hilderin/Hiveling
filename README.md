@@ -550,6 +550,14 @@ config grants it (and the agent's own `permissions` rules). There is no plan
 `auto` option — to allow something, declare it in `opencode.config.permissions`
 or on the agent. This keeps the generated `opencode.json` authoritative.
 
+On top of the declared layers, the worker always grants every agent **read and
+write access to the platform temp directory** (`$TMPDIR` on Linux, `%TEMP%` on
+Windows). A non-interactive run auto-rejects an `ask` permission, so an agent
+that writes a scratch file (a commit-message file, a build artifact) under the
+system temp dir would otherwise abort the whole session. This built-in rule has
+the lowest priority: any `permissions`/`permission` rule declared later (repo
+config, plan sources, plan inline) or on the agent itself still wins.
+
 ### Artifacts
 
 ```yaml

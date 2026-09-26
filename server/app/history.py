@@ -36,6 +36,41 @@ def _extract_into(zip_bytes: bytes, dest: Path) -> None:
                 out.write(src.read())
 
 
+# Evidence kept when a finished attempt is archived before a re-run. The
+# directory itself (``files/``) and its zip are not copied: they can be large
+# and the fresh attempt replaces the task's own history anyway.
+_ATTEMPT_FILES = (
+    "status.json",
+    "result.txt",
+    "events.jsonl",
+    "stderr.log",
+    "worker.json",
+    "request.json",
+)
+
+
+def archive_attempt(directory: Path, attempt: int) -> Path | None:
+    """Copy a finished attempt's evidence into ``attempt-<n>/``.
+
+    ``attempt`` is the 1-based number of the attempt that just finished (the
+    task's ``attempts`` field), so a resume and a gate re-arm on the same task
+    never overwrite each other's archive.
+    """
+    if not directory.is_dir():
+        return None
+    archive = directory / f"attempt-{attempt}"
+    try:
+        archive.mkdir(parents=True, exist_ok=True)
+        for name in _ATTEMPT_FILES:
+            source = directory / name
+            if source.is_file():
+                (archive / name).write_bytes(source.read_bytes())
+    except OSError:
+        return None
+    return archive
+
+
+
 class History:
     def __init__(self, root: Path):
         self.root = root

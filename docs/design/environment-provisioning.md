@@ -983,6 +983,11 @@ Compatibility guarantees:
    The worker never passes `--auto` to `opencode run`: the generated config and
    the agent's `permissions` rules are authoritative, and there is no plan
    `auto` option. Allowing a tool means declaring it in the config/agent.
+   Exception: the worker always adds a lowest-priority default granting every
+   agent read/write on the platform temp directory, because a non-interactive
+   run auto-rejects OpenCode's default `ask` for `external_directory` and a task
+   writing a scratch file under `$TMPDIR`/`%TEMP%` would abort. A later config
+   or agent rule still overrides it.
 4. **Resource validation is worker-side, at prepare.** The server validates
    structure and enums only; no server-side dry-run in v1.
 5. **Config injection is project-scoped**, at a per-job **location directory**;

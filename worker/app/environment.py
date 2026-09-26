@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -346,6 +347,27 @@ def external_permissions(path: Path, *, write: bool = True) -> dict:
     if write:
         rules.append({"action": "edit", "resource": pattern, "effect": "allow"})
     return {"permissions": rules}
+
+
+def temp_permissions(tmp: str | None = None) -> dict:
+    """OpenCode rules letting every agent read/write the platform temp dir.
+
+    A non-interactive ``opencode run`` auto-rejects an ``ask`` permission, so a
+    task that writes a scratch file under ``$TMPDIR`` / ``%TEMP%`` (outside the
+    job workspace) aborts the session. The worker therefore grants the system
+    temp directory to *all* agents by default. Because ``permissions`` is an
+    additive layer, a later repo/plan rule still wins, and an agent's own
+    ``permissions`` still take precedence.
+    """
+    root = Path(tmp if tmp is not None else tempfile.gettempdir()).expanduser().resolve()
+    pattern = str(root / "*")
+    return {
+        "permissions": [
+            {"action": "read", "resource": pattern, "effect": "allow"},
+            {"action": "external_directory", "resource": pattern, "effect": "allow"},
+            {"action": "edit", "resource": pattern, "effect": "allow"},
+        ]
+    }
 
 
 def parse_resources(raw_resources: list | None) -> list[Resource]:
