@@ -22,8 +22,25 @@ import yaml
 
 logger = logging.getLogger("hiveling.worker.capabilities")
 
-# Providers implemented by this worker build. Extended as providers land.
-KNOWN_PROVIDERS: tuple[str, ...] = ("ephemeral", "env", "secret", "git", "path")
+# Providers implemented by this worker build.
+IMPLEMENTED_PROVIDERS: tuple[str, ...] = (
+    "ephemeral",
+    "env",
+    "secret",
+    "git",
+    "path",
+    "command",
+)
+
+# Advertised when capabilities.yaml does not list `providers`. `command` runs
+# arbitrary shell commands, so it is opt-in: list it explicitly to enable it.
+DEFAULT_ENABLED_PROVIDERS: tuple[str, ...] = (
+    "ephemeral",
+    "env",
+    "secret",
+    "git",
+    "path",
+)
 
 # Tools probed on PATH when advertising capabilities.
 DETECTED_TOOLS: tuple[str, ...] = (
@@ -74,7 +91,7 @@ class Capabilities:
             "os": detect_os(),
             "arch": detect_arch(),
             "tools": detect_tools(),
-            "providers": sorted(KNOWN_PROVIDERS),
+            "providers": sorted(DEFAULT_ENABLED_PROVIDERS),
         }
         self._reload(force=True)
 

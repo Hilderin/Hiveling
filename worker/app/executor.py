@@ -125,6 +125,11 @@ def _build_command(binary: str, job: Job, workdir: Path) -> list[str]:
     spec = job.spec
     flags = _run_flags(binary)
     command = [binary, "run", "--format", "json"]
+    # V2 connects to a shared background service by default, whose project may
+    # not be the job directory; --standalone forces a private server bound to
+    # the process cwd, so every task runs in its own working directory.
+    if "--standalone" in flags:
+        command.append("--standalone")
     if "--dir" in flags:
         command += ["--dir", str(workdir)]
     if spec.get("auto", True):
@@ -341,6 +346,11 @@ def execute(job: Job, config: Config) -> None:
             env.update(environment.env)
         for key, value in (job.spec.get("env") or {}).items():
             env[str(key)] = str(value)
+        if os.name != "nt":
+            # OpenCode V2 resolves the working directory from $PWD, and
+            # subprocess(cwd=...) does not update it: without this, a job would
+            # run in the worker's launch directory instead of its own.
+            env["PWD"] = str(workdir)
 
         with open(events_path, "w", encoding="utf-8") as events_file, open(
             stderr_path, "w", encoding="utf-8"

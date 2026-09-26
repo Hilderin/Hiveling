@@ -104,7 +104,7 @@ class Provider(Protocol):
 
 def default_registry() -> dict[str, Provider]:
     """Providers implemented by this worker build, keyed by ``type``."""
-    from .providers import env, ephemeral, git, path, secret
+    from .providers import command, env, ephemeral, git, path, secret
 
     return {
         ephemeral.PROVIDER.name: ephemeral.PROVIDER,
@@ -112,6 +112,7 @@ def default_registry() -> dict[str, Provider]:
         secret.PROVIDER.name: secret.PROVIDER,
         git.PROVIDER.name: git.PROVIDER,
         path.PROVIDER.name: path.PROVIDER,
+        command.PROVIDER.name: command.PROVIDER,
     }
 
 
@@ -141,6 +142,20 @@ class Environment:
 
     def prepare(self) -> None:
         """Validate every resource, then prepare them in order."""
+        # Enforce the worker's provider allowlist (advertised capabilities),
+        # so opted-out providers such as `command` are refused even though the
+        # code is present.
+        allowed = None
+        if self.ctx.capabilities:
+            configured = self.ctx.capabilities.get("providers")
+            if configured is not None:
+                allowed = {str(provider) for provider in configured}
+        for resource in self.resources:
+            if allowed is not None and resource.type not in allowed:
+                raise EnvironmentError(
+                    f"resource provider '{resource.type}' is not enabled on this "
+                    f"worker (enabled: {', '.join(sorted(allowed)) or 'none'})"
+                )
         for resource in self.resources:
             self._provider(resource).validate(resource, self.ctx)
         try:
