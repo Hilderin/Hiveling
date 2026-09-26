@@ -505,12 +505,13 @@ plan sources → plan inline.
 
 Every job gets its own directory under the worker workspace, so finished jobs
 would grow forever. GC removes **terminal** jobs only; running/accepted jobs are
-never touched. Two independent criteria, both off by default:
+never touched. Two independent criteria, **enabled by default**; set either to
+`0` to disable it:
 
-- `--retention-jobs N` (env `WORKER_RETENTION_JOBS`): keep only the newest N
-  finished jobs on the worker (runs at startup, then hourly);
-- `--retention-days D` (env `WORKER_RETENTION_DAYS`): also remove finished jobs
-  older than D days.
+- `--retention-jobs N` (env `WORKER_RETENTION_JOBS`, default **50**): keep only
+  the newest N finished jobs on the worker (runs at startup, then hourly);
+- `--retention-days D` (env `WORKER_RETENTION_DAYS`, default **14**): also
+  remove finished jobs older than D days.
 
 A one-shot command prunes on demand:
 
@@ -521,7 +522,10 @@ python worker/gc.py --workspace .data/worker --keep 20 --days 7
 On the server, finished runs and their history are pruned with
 `dashboard.py --history-retention-runs N` / `--history-retention-days D`
 (env `HIVELING_RETENTION_RUNS` / `HIVELING_RETENTION_DAYS`), applied at startup.
-Both are off by default.
+Server-side retention is off by default (0 = disabled).
+
+The durable git clones (`git.path`, outside the job directories) are a cache and
+are **not** collected; only per-job directories and their worktrees are.
 
 ## `workers.yaml` reference
 

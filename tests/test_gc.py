@@ -17,6 +17,14 @@ def make_job(workspace, job_id, status, age_days=0.0):
     os.utime(status_file, (stamp, stamp))
 
 
+def test_worker_retention_defaults_are_50_and_14():
+    from worker.app.config import Config
+
+    config = Config.from_args([])
+    assert config.retention_jobs == 50
+    assert config.retention_days == 14.0
+
+
 def test_worker_gc_keeps_newest_and_never_running(tmp_path):
     workspace = tmp_path / "worker"
     workspace.mkdir()
@@ -30,6 +38,21 @@ def test_worker_gc_keeps_newest_and_never_running(tmp_path):
     assert (workspace / "run").exists()  # running is never touched
     assert not (workspace / "old").exists()
     assert not (workspace / "mid").exists()
+
+
+def test_worker_gc_tolerates_bom(tmp_path):
+    workspace = tmp_path / "worker"
+    workspace.mkdir()
+    old = workspace / "old"
+    old.mkdir()
+    status = old / "status.json"
+    status.write_text('\ufeff{"status": "succeeded"}', encoding="utf-8")
+    stamp = time.time() - 3600
+    os.utime(status, (stamp, stamp))
+    make_job(workspace, "new", "succeeded", age_days=0)
+    result = prune(workspace, keep=1)
+    assert result["removed"] == 1
+    assert not old.exists()
 
 
 def test_worker_gc_disabled_by_default(tmp_path):

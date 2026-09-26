@@ -63,7 +63,7 @@ def prune(
             # (or is still being created): leave it alone.
             continue
         try:
-            status = json.loads(status_file.read_text(encoding="utf-8")).get("status")
+            status = json.loads(status_file.read_text(encoding="utf-8-sig")).get("status")
         except (OSError, json.JSONDecodeError):
             continue
         if status not in TERMINAL_STATUSES:

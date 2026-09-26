@@ -23,8 +23,8 @@ class Config:
     capabilities_file: Path | None = None
     secrets_file: Path | None = None
     opencode_dir: Path | None = None
-    retention_jobs: int = 0
-    retention_days: float = 0.0
+    retention_jobs: int = 50
+    retention_days: float = 14.0
     # Set by create_app: live Capabilities / SecretStore objects (hot-reloaded).
     capabilities: Any = None
     secrets: Any = None
@@ -111,14 +111,14 @@ class Config:
         parser.add_argument(
             "--retention-jobs",
             type=int,
-            default=int(os.environ.get("WORKER_RETENTION_JOBS", "0")),
-            help="keep only the newest N finished jobs (0 disables, default)",
+            default=int(os.environ.get("WORKER_RETENTION_JOBS", "50")),
+            help="keep only the newest N finished jobs (default 50; 0 disables)",
         )
         parser.add_argument(
             "--retention-days",
             type=float,
-            default=float(os.environ.get("WORKER_RETENTION_DAYS", "0")),
-            help="also remove finished jobs older than N days (0 disables, default)",
+            default=float(os.environ.get("WORKER_RETENTION_DAYS", "14")),
+            help="also remove finished jobs older than N days (default 14; 0 disables)",
         )
         args = parser.parse_args(argv)
 

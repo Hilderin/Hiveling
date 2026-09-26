@@ -24,7 +24,7 @@ TERMINAL_STATUSES = {"succeeded", "failed", "canceled"}
 def _run_state(run_dir: Path) -> tuple[str | None, float]:
     run_file = run_dir / "run.json"
     try:
-        data = json.loads(run_file.read_text(encoding="utf-8"))
+        data = json.loads(run_file.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return None, 0.0
     status = data.get("status")
