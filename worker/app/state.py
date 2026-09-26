@@ -37,6 +37,8 @@ class Job:
     added: list[str] = field(default_factory=list)
     modified: list[str] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
+    commits: list = field(default_factory=list)
+    artifacts: list = field(default_factory=list)
     cancel_requested: bool = False
     shutdown_requested: bool = False
     process: Any = None
@@ -67,6 +69,8 @@ class Job:
             "added": self.added,
             "modified": self.modified,
             "deleted": self.deleted,
+            "commits": self.commits,
+            "artifacts": self.artifacts,
         }
 
     def save(self) -> None:
@@ -135,6 +139,8 @@ class Registry:
             job.added = data.get("added") or []
             job.modified = data.get("modified") or []
             job.deleted = data.get("deleted") or []
+            job.commits = data.get("commits") or []
+            job.artifacts = data.get("artifacts") or []
             if job.status in ACTIVE_STATUSES:
                 job.status = "failed"
                 job.error = "worker restarted during the job"

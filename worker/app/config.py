@@ -6,6 +6,7 @@ import argparse
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
@@ -20,6 +21,8 @@ class Config:
     log_dir: Path
     heartbeat_s: float
     capabilities_file: Path | None = None
+    # Set by create_app: the live Capabilities object (hot-reloaded).
+    capabilities: Any = None
 
     @classmethod
     def from_args(cls, argv: list[str] | None = None) -> "Config":

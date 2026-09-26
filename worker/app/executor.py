@@ -19,6 +19,13 @@ from functools import lru_cache
 from pathlib import Path
 
 from .config import Config
+from .environment import (
+    Context,
+    Environment,
+    EnvironmentError,
+    JobOutcome,
+    parse_resources,
+)
 from .snapshot import diff, snapshot
 from .state import Job
 
@@ -218,6 +225,25 @@ def _pump(stream, sink, accumulator: _EventAccumulator | None) -> None:
             pass
 
 
+def _capabilities(config: Config) -> dict:
+    capabilities = getattr(config, "capabilities", None)
+    if capabilities is None:
+        return {}
+    try:
+        return capabilities.get()
+    except Exception:
+        return {}
+
+
+def _fail_before_start(job: Job, error: str) -> None:
+    """Mark a job failed before OpenCode ran (environment error)."""
+    job.status = "failed"
+    job.error = error
+    job.finished_at = time.time()
+    job.save()
+    logger.warning("job %s: %s", job.job_id, error)
+
+
 def execute(job: Job, config: Config) -> None:
     """Run the job (called from a dedicated thread). Updates ``job``."""
     workdir = job.workdir
@@ -226,6 +252,33 @@ def execute(job: Job, config: Config) -> None:
     stderr_path = job.dir / "stderr.log"
     before_path = job.dir / "snapshot_before.json"
 
+    # Provision the task's resources before doing anything else: a validation or
+    # prepare failure must abort before OpenCode starts.
+    capabilities = _capabilities(config)
+    environment: Environment | None = None
+    try:
+        resources = parse_resources(job.spec.get("resources"))
+    except EnvironmentError as exc:
+        _fail_before_start(job, f"environment error: {exc}")
+        return
+    if resources:
+        ctx = Context(
+            workspace=workdir,
+            job_dir=job.dir,
+            task_id=str(job.spec.get("task_id") or job.job_id),
+            run_id=job.spec.get("run_id"),
+            path_roots=list(capabilities.get("path_roots") or []),
+            capabilities=capabilities,
+        )
+        environment = Environment(resources, ctx)
+        try:
+            environment.prepare()
+        except EnvironmentError as exc:
+            _fail_before_start(job, f"environment error: {exc}")
+            return
+
+    # Snapshot *after* provisioning, so a checkout/clean is not reported as a
+    # change made by OpenCode.
     before = snapshot(workdir)
     before_path.write_text(json.dumps(before, indent=2), encoding="utf-8")
 
@@ -257,6 +310,8 @@ def execute(job: Job, config: Config) -> None:
         )
         logger.info("job %s: command: %s", job.job_id, _describe_command(command))
         env = os.environ.copy()
+        if environment is not None:
+            env.update(environment.env)
         for key, value in (job.spec.get("env") or {}).items():
             env[str(key)] = str(value)
 
@@ -327,6 +382,33 @@ def execute(job: Job, config: Config) -> None:
     job.deleted = deleted
     job.exit_code = return_code
 
+    # Publish the task's resources (commit/push, collect artifacts). A finalize
+    # failure is a real failure; teardown always runs.
+    finalize_error: str | None = None
+    if environment is not None:
+        succeeded = (
+            not job.shutdown_requested
+            and not job.cancel_requested
+            and not timed_out
+            and error is None
+            and return_code == 0
+        )
+        try:
+            outcome_result = environment.finalize(
+                JobOutcome(
+                    status="succeeded" if succeeded else "failed",
+                    succeeded=succeeded,
+                    changed_files=sorted(set(added) | set(modified)),
+                    workdir=workdir,
+                )
+            )
+            job.commits = outcome_result.commits
+            job.artifacts = outcome_result.artifacts
+        except EnvironmentError as exc:
+            finalize_error = str(exc)
+        finally:
+            environment.teardown()
+
     if job.shutdown_requested:
         job.status = "failed"
         job.error = "worker shutting down"
@@ -351,6 +433,12 @@ def execute(job: Job, config: Config) -> None:
         message = stderr_tail or accumulator.error_text()
         if message:
             job.error = message[-2000:]
+
+    if finalize_error is not None:
+        job.status = "failed"
+        job.error = ((job.error + " | ") if job.error else "") + (
+            f"finalize failed: {finalize_error}"
+        )
 
     job.finished_at = time.time()
     job.save()

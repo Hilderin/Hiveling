@@ -826,6 +826,8 @@ class Orchestrator:
 
         request = {
             "job_id": job_id,
+            "task_id": task.id,
+            "run_id": self.run_id,
             "prompt": task.prompt,
             "model": task.model,
             "agent": task.agent,
@@ -834,6 +836,8 @@ class Orchestrator:
             "variant": task.variant,
             "title": task.title,
             "env": task.env,
+            "resources": task.resources,
+            "artifacts": task.artifacts,
         }
         # 'files' sent to OpenCode is intentionally empty: input files are
         # already extracted into the working directory.

@@ -17,6 +17,44 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 DownloadMode = Literal["modified", "all", "none"]
 
 
+class ResourceInput(BaseModel):
+    """One resource a task needs materialized by a worker provider."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    type: str = Field(
+        description="Provider type (ephemeral today; git, path, env, secret, command later)."
+    )
+    id: str | None = Field(
+        default=None,
+        description="Stable id within the task (defaults to <type>-<index>); resources merge by id across defaults and task.",
+    )
+    when: dict | None = Field(
+        default=None, description="Optional worker-capability guard (os/tags/providers/labels)."
+    )
+    options: dict = Field(
+        default_factory=dict,
+        alias="with",
+        description="Provider-specific options (e.g. git repo/ref/branch).",
+    )
+
+
+class ArtifactsInput(BaseModel):
+    """How a task's results are collected."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    download: DownloadMode | None = Field(
+        default=None, description="zip channel: modified (default) | all | none."
+    )
+    git: bool | None = Field(
+        default=None, description="Include commits/published refs in the task result."
+    )
+    paths: list[str] | None = Field(
+        default=None, description="Extra globs collected beyond the workdir diff."
+    )
+
+
 class RequirementsInput(BaseModel):
     """Worker capabilities a task needs. Merged over defaults; matched as a subset."""
 
@@ -51,6 +89,12 @@ class DefaultsInput(BaseModel):
     files: list[str] | None = Field(default=None, description="Input paths/globs relative to the plan.")
     requirements: RequirementsInput | None = Field(
         default=None, description="Worker capabilities every task needs (merged with task-level requirements)."
+    )
+    resources: list[ResourceInput] | None = Field(
+        default=None, description="Resources every task materializes (merged with task resources by id)."
+    )
+    artifacts: ArtifactsInput | None = Field(
+        default=None, description="How every task's results are collected."
     )
     max_parallel: int | None = Field(
         default=None,
@@ -88,6 +132,12 @@ class TaskInput(BaseModel):
         default=None,
         description="Worker capabilities this task needs (merged over defaults); the task only runs on a matching worker.",
     )
+    resources: list[ResourceInput] | None = Field(
+        default=None, description="Resources this task materializes (merged with defaults by id)."
+    )
+    artifacts: ArtifactsInput | None = Field(
+        default=None, description="How this task's results are collected."
+    )
 
     @model_validator(mode="after")
     def _require_prompt(self) -> "TaskInput":
@@ -112,7 +162,7 @@ class PlanInput(BaseModel):
 
 def plan_to_dict(plan: PlanInput) -> dict:
     """Drop unset fields so the YAML stays clean."""
-    return plan.model_dump(exclude_none=True, exclude_defaults=False)
+    return plan.model_dump(exclude_none=True, exclude_defaults=False, by_alias=True)
 
 
 def plan_to_yaml(plan: PlanInput) -> str:
@@ -133,6 +183,9 @@ Top-level keys:
   - `model`, `agent`, `auto` (bool), `timeout_s` (number), `variant`,
     `download` (`modified` | `all` | `none`), `env` (map), `files` (list)
   - `requirements` (mapping): worker capabilities every task needs
+  - `resources` (list): resources every task materializes (merged with task
+    resources by `id`)
+  - `artifacts` (mapping): how every task's results are collected
   - `max_parallel` (int): max tasks running at once; 0/unset means one per free
     worker
 - `tasks` (required, list). Each task:
@@ -150,6 +203,21 @@ Top-level keys:
     (all required), `providers` (all required), `labels` (exact per key). With
     no requirements the task runs on any free worker. Use list_workers to see
     the capabilities each worker advertises.
+  - `resources` (list, merged over defaults by `id`): each entry is
+    `{type, id?, when?, with?}`. `type` selects a worker provider; `with` holds
+    provider-specific options. Resources are validated and prepared on the
+    worker *before* OpenCode starts. Today the only provider is `ephemeral`
+    (a fresh, isolated working directory: the historical behavior).
+  - `artifacts` (mapping): `download` (`modified`|`all`|`none`) selects the zip
+    channel; `git` and `paths` are reserved for later stages.
+
+Resource notes:
+
+- Resources merge by `id` across `defaults.resources` and the task: a same-`id`
+  task resource overrides the default one, new ids append. Without `id`, a
+  resource gets a generated id and simply accumulates.
+- A resource whose `type` the worker does not implement fails the task at
+  prepare, before OpenCode runs, with a clear error.
 
 Notes:
 

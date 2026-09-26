@@ -34,6 +34,8 @@ class Task:
     inputs_from: list[str] = field(default_factory=list)
     download: str = "modified"  # modified | all | none
     requirements: dict = field(default_factory=dict)
+    resources: list[dict] = field(default_factory=list)
+    artifacts: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -98,6 +100,39 @@ def _merge_requirements(defaults: dict, task: dict) -> dict:
     return merged
 
 
+def _merge_resources(default_defaults: list | None, task_resources: list | None) -> list[dict]:
+    """Merge resources by ``id``: task overrides default, new ids append.
+
+    A resource without ``id`` gets a generated, position-based id, so anonymous
+    resources never collide and simply accumulate.
+    """
+    merged: dict[str, dict] = {}
+    order: list[str] = []
+    for raw in list(default_defaults or []) + list(task_resources or []):
+        if not isinstance(raw, dict):
+            raise PlanError(f"invalid resource: {raw!r}")
+        rtype = raw.get("type")
+        if not rtype:
+            raise PlanError(f"resource without a 'type': {raw!r}")
+        resource_id = str(raw.get("id") or f"{rtype}-{len(order)}")
+        entry = dict(raw)
+        entry["id"] = resource_id
+        if resource_id not in merged:
+            order.append(resource_id)
+        merged[resource_id] = entry
+    return [merged[resource_id] for resource_id in order]
+
+
+def _merge_artifacts(defaults: dict, override: dict | None) -> dict:
+    merged: dict = {}
+    base = defaults.get("artifacts")
+    if isinstance(base, dict):
+        merged.update(base)
+    if isinstance(override, dict):
+        merged.update(override)
+    return merged
+
+
 def _parse_task(raw: dict, defaults: dict, base_dir: Path) -> Task:
     if not isinstance(raw, dict):
         raise PlanError(f"invalid task: {raw!r}")
@@ -114,6 +149,9 @@ def _parse_task(raw: dict, defaults: dict, base_dir: Path) -> Task:
         return raw[key] if key in raw else defaults.get(key, fallback)
 
     timeout = pick("timeout_s")
+    artifacts = _merge_artifacts(defaults, raw.get("artifacts") or {})
+    download = str(artifacts.get("download") or pick("download", "modified"))
+    resources = _merge_resources(defaults.get("resources"), raw.get("resources"))
     return Task(
         id=str(task_id),
         prompt=_load_prompt(raw, base_dir),
@@ -127,10 +165,12 @@ def _parse_task(raw: dict, defaults: dict, base_dir: Path) -> Task:
         env={str(k): str(v) for k, v in env.items()},
         depends_on=[str(d) for d in (raw.get("depends_on") or [])],
         inputs_from=[str(d) for d in (raw.get("inputs_from") or [])],
-        download=str(pick("download", "modified")),
+        download=download,
         requirements=_merge_requirements(
             defaults.get("requirements") or {}, raw.get("requirements") or {}
         ),
+        resources=resources,
+        artifacts=artifacts,
     )
 
 

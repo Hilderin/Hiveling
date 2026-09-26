@@ -46,6 +46,10 @@ class JobSpec(BaseModel):
     title: str | None = None
     env: dict[str, str] = Field(default_factory=dict)
     files: list[str] = Field(default_factory=list)
+    task_id: str | None = None
+    run_id: str | None = None
+    resources: list[dict] = Field(default_factory=list)
+    artifacts: dict = Field(default_factory=dict)
 
 
 def _janitor(registry: Registry, config: Config, stop: threading.Event) -> None:
@@ -81,6 +85,7 @@ def create_app(config: Config) -> FastAPI:
     registry = Registry()
     registry.load_from_disk(config.workspace)
     capabilities = Capabilities(config.capabilities_file)
+    config.capabilities = capabilities
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
