@@ -327,3 +327,27 @@ def test_attempt_counter_reloaded_from_run_state(tmp_path):
     # A resumed server continues counting from the persisted value.
     assert reloaded._next_attempt("a") == 4
 
+
+def test_gate_archive_uses_the_finished_attempt_number(tmp_path):
+    """A rejected target is archived under its own attempt, not the gate's."""
+    orch, store, run_id = _orchestrator(tmp_path, BASIC)
+    rel = "a/2026-01-01T00-00-00-test"
+    history = tmp_path / "history" / rel
+    history.mkdir(parents=True)
+    (history / "status.json").write_text('{"status": "succeeded"}', encoding="utf-8")
+    (history / "events.jsonl").write_text("{}\n", encoding="utf-8")
+    orch._store_task("a", status="succeeded", attempts=1, history_rel=rel)
+    orch._store_task("ga", status="running", attempts=1)
+
+    orch._handle_events(
+        [("result", "ga", None, TaskResult("ga", "succeeded", text="fix it", gate_valid=False, history_rel=None))],
+        {"a": "succeeded", "ga": "running"},
+        {"ga": (None, None)},
+    )
+
+    # The gate's first evaluation archives the target's finished attempt 1.
+    assert (history / "attempt-1" / "status.json").is_file()
+    assert (history / "attempt-1" / "events.jsonl").is_file()
+    # The target keeps its finished attempt number until the re-dispatch.
+    assert {t["id"]: t for t in store.read(run_id)["tasks"]}["a"]["attempts"] == 1
+
