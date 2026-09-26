@@ -137,8 +137,9 @@ consumer has read it: consumers depend on the gate). The injected block is
 role-neutral: *a producer fixes its artifact; a reviewer re-inspects the updated
 artifact and rewrites its report* (producers and reviewers are re-run in
 dependency order, so a reviewer that consumes the producer's branch sees the
-updated tree). A rejection also bumps `gate_attempt`; after `max_attempts`
-rejections the gate is marked `failed`.
+updated tree). A negative evaluation bumps `gate_attempt` (shown in the dashboard
+as `attempt N/M`); after `max_attempts` negative evaluations the gate is marked
+`failed`.
 
 **One unit, one gate.** List in `tasks` everything that must be re-run on a
 rejection — the producer **and** the reviewer that judges it. A reviewer target
@@ -150,13 +151,14 @@ consumes a target must still depend on the gate.
 
 1. a task belongs to **at most one gate**, and a gate cannot analyse a gate;
 2. **every consumer of a gated task must depend on the gate**, not on the task
-   directly. This is what prevents a consumer from running on an un-approved
-   artifact.
+   directly — except a task that is itself a target of the same gate (e.g. a
+   reviewer that consumes the producer target; both reset together). This is
+   what prevents a consumer from running on an un-approved artifact.
 
 **Observable:** the gate is a task in `run.json`/`get_task` with
-`kind: "gate"`, `gate_targets`, `gate_attempt` (rejections), `gate_max_attempts`,
-`gate_verdict` and `gate_feedback`; the dashboard shows it distinctly and opens
-it on its own page.
+`kind: "gate"`, `gate_targets`, `gate_attempt` (negative evaluations so far;
+`attempt N/M` in the UI), `gate_max_attempts`, `gate_verdict` and
+`gate_feedback`; the dashboard shows it distinctly and opens it on its own page.
 
 ### Recipe: gate a phase
 
@@ -282,7 +284,7 @@ Decision rules:
 | Stops the run | Does not stop the run |
 | --- | --- |
 | A task ending `failed` (process, publish, no matching worker, timeout) | A task whose `result_text` says the work is wrong |
-| A **gate** `failed` after its `max_attempts` rejections | A gate rejection (it re-runs the work instead) |
+| A **gate** `failed` after `max_attempts` negative evaluations | A gate rejection (it re-runs the work instead) |
 | `cancel_run` (whole run); `cancel_task` (one task, dependents skip) | A verdict written in a file nobody reads |
 | A dependency that did not succeed → dependent `skipped` | |
 
@@ -379,7 +381,7 @@ finding if omitted:
    depend on the gate**.
 7. Gated tasks download their deliverable (`download: modified`/`all`), or the
    gate only sees their report.
-8. `max_attempts` is sane for the phase (default 20 rejections before the run
+8. `max_attempts` is sane for the phase (default 20 evaluations before the run
    fails).
 9. Every phase whose output must be judged has a **gate** (a review task alone
    does not enforce anything); if a reviewer writes a report, it is listed in
