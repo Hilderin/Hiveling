@@ -23,6 +23,10 @@ V1 characteristics:
   returns).
 - Workers are configured once in `.data/workers.yaml`; the list is reloaded
   automatically when the file changes, so adding a worker needs no restart.
+- Tasks can declare **requirements** (matched against worker capabilities) and
+  **resources** materialized by the worker before OpenCode runs (git repos and
+  worktrees, env vars, secrets, folders, shell commands, OpenCode config/agents/
+  skills). See [Resources (environment)](#resources-environment).
 - No authentication on the JSON API/dashboard; the MCP endpoint supports an
   optional bearer token.
 - An MCP (Streamable HTTP) endpoint lets a local OpenCode start and monitor
@@ -342,6 +346,17 @@ defaults:                # optional, applied to every task unless overridden
   auto: true             # pass --auto to opencode
   timeout_s: 600
   download: modified     # modified | all | none
+  requirements:          # only dispatch to a matching worker (see below)
+    os: windows
+    tags: [mssql]
+  resources:             # what to materialize on the worker before OpenCode runs
+    - type: git
+      id: app
+      with: {repo: "...", path: "...", worktree: true, ref: main, branch: "hiveling/{run}/{task}", publish: push}
+  artifacts:
+    download: modified
+  opencode:              # OpenCode runtime config injected for every task
+    agents_paths: [/opt/team/agents]
   max_parallel: 2        # optional: cap concurrent tasks (0/unset = one per free worker)
 
 tasks:
@@ -357,13 +372,125 @@ tasks:
     env: {KEY: value}    # extra environment variables for the subprocess
     download: none
     depends_on: []       # ordering + skip if a dependency fails
-    inputs_from: []      # reuse files downloaded from previous tasks
+    inputs_from: []      # reuse files downloaded from previous tasks (zip channel)
+    requirements: {}     # merged over defaults
+    resources: []        # merged over defaults by id
+    artifacts: {}
+    opencode: {}
 ```
 
 - `depends_on` and `inputs_from` both imply ordering; `inputs_from` also feeds
   the previous task's downloaded files into the current task's working
-  directory.
+  directory. `inputs_from` is the **file (zip) channel only** — git flows
+  through resources (see below).
 - `files` are also sent as a zip before the task starts.
+
+### Requirements (capabilities)
+
+A worker advertises capabilities through `GET /health`: `os`, `arch`, `tools`,
+`providers`, `tags`, `labels` and (optionally) `path_roots`. A task's
+`requirements` are matched as a subset, so it only runs on a worker that can
+satisfy them; without requirements it runs on any free worker. If no reachable
+worker matches, the task **fails fast** instead of waiting for a worker.
+`list_workers` shows every worker's capabilities.
+
+```yaml
+requirements:
+  os: windows            # exact match
+  tags: [mssql]          # all required
+  providers: [git]       # all required
+  labels: {site: office} # exact per key
+```
+
+The worker reads an optional `capabilities.yaml` (default `./capabilities.yaml`,
+hot-reloaded; `--capabilities-file` / `WORKER_CAPABILITIES`):
+
+```yaml
+tags: [legacy, mssql]
+labels: {site: office-mtl}
+providers: [ephemeral, env, secret, git, path]   # allowlist
+path_roots: ["D:\\src", "D:\\data"]              # absolute paths a plan may use
+```
+
+### Resources (environment)
+
+A task's `resources` are validated and prepared on the worker **before**
+OpenCode starts, so a misconfiguration fails fast. Resources merge by `id`
+across `defaults.resources` and the task (a same-`id` task resource overrides;
+new ids append). Built-in providers:
+
+| `type` | `with` options | Effect |
+| --- | --- | --- |
+| `ephemeral` | — | A fresh, isolated working directory (the default behavior). |
+| `env` | `vars` | Inject environment variables (`${NAME}` expands the worker env). |
+| `secret` | `name`, `as?`, `required?` | Inject a secret resolved **on the worker** (never in the plan). |
+| `git` | `repo`, `path`, `worktree?`, `ref?`, `branch?`, `branch_mode?`, `push_to?`, `clean?`, `cache?`, `publish?`, `remote?`, `force?` | Clone/reset/checkout, optional per-task worktree, commit/push. |
+| `path` | `path`, `mode` (`ro`/`rw`), `visible?` | Expose an existing folder. |
+| `command` | `prepare`, `finalize`, `shell?`, `env?`, `cwd?`, `timeout_s?` | **Opt-in** escape hatch: shell commands around the run. |
+
+`git` semantics: `ref` is the **start point** (branch/tag/sha), `branch` is the
+**target** the task commits to, `publish` is `none|commit|push`, `clean` is
+`none|git|full`, `cache` lists paths preserved across a clean. To consume
+another task's branch, declare the same repo with
+`ref: "hiveling/{run}/<producer>"` and `depends_on: [<producer>]` — there is no
+cross-task substitution. `{run}` and `{task}` in option strings are resolved by
+the server.
+
+Absolute paths (`git.path`, `path.path`, `opencode` sources) must live under the
+worker's `path_roots`; relative paths resolve under the job workspace.
+
+### OpenCode config injection
+
+`opencode` (in defaults and/or per task) builds a per-job OpenCode config at the
+job's working directory. It takes **inline** content or **worker-local paths**,
+so plans carry paths instead of re-writing agent/skill bodies:
+
+```yaml
+opencode:
+  config: {model: provider/model, permissions: [...]}   # inline opencode.json fragment
+  agents: {reviewer: "You are ..."}                     # inline agents
+  skills: [{name: run-tests, content: "..."}]           # inline skills
+  from: [/opt/team/opencode]        # bundle: opencode.json + agents/ + skills/ + AGENTS.md
+  agents_paths: [/opt/team/agents]  # agent *.md directories (symlinked/junctioned)
+  skills_paths: [~/shared/skills]   # skill directories (referenced by path in config)
+  agents_md: [/opt/team/AGENTS.md]  # concatenated into <workdir>/AGENTS.md
+  sources:                          # verbose form with mode/priority/optional
+    - {kind: agents, path: /opt/team/agents, priority: 10}
+```
+
+Precedence (low → high): worker baseline bundle (`--opencode-dir`, default
+`./opencode`), repo/config provenance reported by `git`/`path`, plan sources,
+then plan inline. Skills are added to the config `skills` array; agents are
+symlinked into `.opencode/agents/`; `AGENTS.md` files are concatenated.
+
+### Artifacts
+
+```yaml
+artifacts:
+  download: modified      # zip: modified (default) | all | none
+  paths: ["reports/**"]   # extra globs added to the zip beyond the workdir diff
+  git: true               # keep the commits/branches a git resource published
+```
+
+Commits (branch, sha, remote, pushed) are recorded in the run state
+(`run.json`), printed by the CLI and returned by `get_task`.
+
+## Worker configuration
+
+Besides its workspace (`.data/worker`) and logs, a worker reads three optional,
+hot-reloaded configuration files and adverts them through `/health`:
+
+| File | Flag / env | Role |
+| --- | --- | --- |
+| `capabilities.yaml` | `--capabilities-file` / `WORKER_CAPABILITIES` | Advertised capabilities (`tags`, `labels`, `providers`, `path_roots`) merged with auto-detection. |
+| `secrets.yaml` | `--secrets-file` / `WORKER_SECRETS` | Flat `NAME: value` store; a plan only ever references secret **names** (the worker environment is the fallback). |
+| `opencode/` | `--opencode-dir` / `WORKER_OPENCODE_DIR` | Baseline OpenCode bundle (`opencode.json`, `agents/`, `skills/`, `AGENTS.md`) applied to every job. |
+
+`providers` acts as an allowlist: a plan resource whose provider is not listed
+is refused. `command` runs arbitrary shell commands and is **not** advertised by
+default; list it explicitly to enable it. Migrate absolute paths to
+`path_roots` so plans cannot reach outside them (`path_roots: ["*"]` disables
+the check explicitly).
 
 ## `workers.yaml` reference
 
@@ -510,8 +637,9 @@ The tail of the file therefore tells the failure mode:
 | `worker stopped` | clean shutdown (Ctrl+C, in-process exit) |
 | a `heartbeat` with no `worker stopped` | the process was killed abruptly (`taskkill /F`, parent session reaping, power loss) |
 
-Flags: `--log-dir` (default `./.data/logs`, env `WORKER_LOG_DIR`) and
-`--log-level` (default `info`, env `WORKER_LOG_LEVEL`).
+Flags: `--log-dir` (default `./.data/logs`, env `WORKER_LOG_DIR`), `--log-level`
+(default `info`, env `WORKER_LOG_LEVEL`), plus `--capabilities-file`,
+`--secrets-file` and `--opencode-dir` (see [Worker configuration](#worker-configuration)).
 
 ## Current limitations
 
@@ -530,7 +658,7 @@ Flags: `--log-dir` (default `./.data/logs`, env `WORKER_LOG_DIR`) and
   automatically).
 - Live plan edits apply between tasks; a task already `running` is never
   interrupted.
-- Task working directories are independent: use `inputs_from` to pass files
-  between tasks.
+- Task working directories are independent: use `inputs_from` (files) or a
+  `git` resource (branches) to pass work between tasks.
 - Long prompts are passed as command-line arguments (Windows command-line
   length limits apply).
