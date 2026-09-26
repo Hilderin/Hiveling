@@ -31,3 +31,18 @@ def test_requirements_and_resources_roundtrip():
     content = plan_to_yaml(plan)
     assert "requirements:" in content
     assert "os: windows" in content
+
+
+def test_auto_is_no_longer_a_plan_option():
+    """`auto` was removed: permissions come from the injected opencode.json.
+
+    The worker no longer passes `--auto`, so an unknown `auto` key must be
+    rejected instead of silently ignored.
+    """
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        PlanInput(tasks=[{"id": "a", "prompt": "p", "auto": False}])
+    with pytest.raises(ValidationError):
+        PlanInput(defaults={"auto": True}, tasks=[{"id": "a", "prompt": "p"}])

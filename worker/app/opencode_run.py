@@ -19,7 +19,6 @@ def build_command(
     *,
     model: str | None = None,
     agent: str | None = None,
-    auto: bool = True,
     standalone: bool = False,
     format_json: bool = True,
 ) -> list[str]:
@@ -28,8 +27,6 @@ def build_command(
         command += ["--format", "json"]
     if standalone:
         command.append("--standalone")
-    if auto:
-        command.append("--auto")
     if model:
         command += ["--model", model]
     if agent:
@@ -45,7 +42,6 @@ def run(
     *,
     model: str | None = None,
     agent: str | None = None,
-    auto: bool = True,
     standalone: bool = False,
     timeout_s: float | None = None,
     env: dict | None = None,
@@ -60,7 +56,6 @@ def run(
         prompt,
         model=model,
         agent=agent,
-        auto=auto,
         standalone=standalone,
     )
     return subprocess.run(

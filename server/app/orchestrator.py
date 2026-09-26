@@ -857,7 +857,6 @@ class Orchestrator:
             "prompt": task.prompt,
             "model": task.model,
             "agent": task.agent,
-            "auto": task.auto,
             "timeout_s": task.timeout_s,
             "variant": task.variant,
             "title": task.title,

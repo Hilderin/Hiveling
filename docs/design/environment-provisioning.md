@@ -974,9 +974,18 @@ Compatibility guarantees:
 2. **Finalize failures fail the task.** There is no `warn` mode and no
    per-resource publish policy. A failed commit/push marks the task `failed`
    even if OpenCode succeeded; the OpenCode result is still kept in history.
-3. **Resource validation is worker-side, at prepare.** The server validates
+   A `publish: push` with **nothing to push** (no edit and no prepare-time
+   merge) is also a failure: publishing an empty branch means the agent edited
+   a tree the provider never commits, and a silent success only surfaces as a
+   `merge ref not found` in the consumer. Reading-only tasks use
+   `publish: none` or `commit`.
+3. **Permissions come from the injected `opencode.json`, not a CLI flag.**
+   The worker never passes `--auto` to `opencode run`: the generated config and
+   the agent's `permissions` rules are authoritative, and there is no plan
+   `auto` option. Allowing a tool means declaring it in the config/agent.
+4. **Resource validation is worker-side, at prepare.** The server validates
    structure and enums only; no server-side dry-run in v1.
-4. **Config injection is project-scoped**, at a per-job **location directory**;
+5. **Config injection is project-scoped**, at a per-job **location directory**;
    no `XDG_CONFIG_HOME` / `HOME` relocation (section 9.1).
 5. **Multiple `AGENTS.md` are concatenated** into `location/AGENTS.md`, in
    priority order, each behind a `<!-- source: ... -->` marker. A repo

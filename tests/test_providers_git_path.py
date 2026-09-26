@@ -162,3 +162,80 @@ def test_path_provider_missing_folder_fails(tmp_path):
     resource = Resource(type="path", id="x", options={"path": str(tmp_path / "absent")})
     with pytest.raises(EnvironmentError):
         Environment([resource], ctx).prepare()
+
+
+def test_git_worktree_relative_path_stages_clone_outside_workspace(tmp_path, bare_repo):
+    """A relative `path` must not leave a second tree in the job workspace.
+
+    Regression: the clone at `<workspace>/repo` looked like the checkout, so the
+    agent edited it while the provider committed the real worktree at
+    `<workspace>/src/app` — `publish: push` silently pushed nothing.
+    """
+    ctx = make_ctx(tmp_path)
+    resource = Resource(
+        type="git",
+        id="app",
+        options={
+            "repo": str(bare_repo),
+            "path": "repo",
+            "worktree": True,
+            "ref": "main",
+            "branch": "hiveling/r1/t1",
+            "publish": "commit",
+        },
+    )
+    env = Environment([resource], ctx)
+    env.prepare()
+    prepared = env.prepared[0]
+    workdir = Path(prepared.state["repo_dir"])
+    assert workdir == (tmp_path / "loc" / "src" / "app").resolve()
+    assert Path(prepared.state["clone"]) == (tmp_path / "repos" / "app").resolve()
+    assert not (tmp_path / "loc" / "repo").exists()
+
+    (workdir / "feat.txt").write_text("z", encoding="utf-8")
+    result = env.finalize(JobOutcome(status="succeeded", succeeded=True, workdir=workdir))
+    assert result.commits and result.commits[0]["branch"] == "hiveling/r1/t1"
+    env.teardown()
+
+
+def test_git_worktree_path_collision_is_rejected(tmp_path, bare_repo):
+    ctx = make_ctx(tmp_path)
+    resource = Resource(
+        type="git",
+        id="app",
+        options={
+            "repo": str(bare_repo),
+            "path": str(tmp_path / "loc" / "src" / "app"),
+            "worktree": True,
+            "ref": "main",
+            "branch": "hiveling/r1/t1",
+            "publish": "commit",
+        },
+    )
+    with pytest.raises(EnvironmentError):
+        Environment([resource], ctx).prepare()
+
+
+def test_summarize_working_dirs_names_the_worktree(tmp_path, bare_repo):
+    from worker.app.environment import summarize_working_dirs
+
+    ctx = make_ctx(tmp_path)
+    resource = Resource(
+        type="git",
+        id="app",
+        options={
+            "repo": str(bare_repo),
+            "path": "repo",
+            "worktree": True,
+            "ref": "main",
+            "branch": "hiveling/r1/t1",
+            "publish": "push",
+        },
+    )
+    env = Environment([resource], ctx)
+    env.prepare()
+    note = summarize_working_dirs(env.prepared, ctx.workspace)
+    assert "./src/app" in note
+    assert "hiveling/r1/t1" in note
+    assert "publish push" in note
+    assert summarize_working_dirs([], ctx.workspace) == ""

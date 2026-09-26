@@ -62,7 +62,7 @@ class OpencodeSourceInput(BaseModel):
 
     kind: str = Field(description="bundle | config | agents | skills | agents_md.")
     path: str = Field(description="Worker-local path (resolved under path_roots).")
-    mode: str | None = Field(default=None, description="auto | symlink | reference | concat | copy.")
+    mode: str | None = Field(default=None, description="symlink | reference | concat | copy (default auto).")
     priority: int | None = Field(default=None, description="Higher wins / concatenates later.")
     optional: bool | None = Field(default=None, description="Skip a missing path instead of failing.")
     when: dict | None = Field(default=None, description="Capability guard (reserved).")
@@ -109,7 +109,6 @@ class DefaultsInput(BaseModel):
 
     model: str | None = Field(default=None, description="Model id, e.g. provider/model or provider/model#variant.")
     agent: str | None = Field(default=None, description="OpenCode agent, e.g. 'build'.")
-    auto: bool | None = Field(default=None, description="Pass --auto to opencode (default true).")
     timeout_s: float | None = Field(default=None, description="Per-task timeout in seconds.")
     variant: str | None = Field(default=None, description="Model variant (reasoning effort).")
     download: DownloadMode | None = Field(default=None, description="modified (default) | all | none.")
@@ -146,7 +145,6 @@ class TaskInput(BaseModel):
     )
     model: str | None = Field(default=None, description="Override the default model.")
     agent: str | None = Field(default=None, description="Override the default agent.")
-    auto: bool | None = Field(default=None, description="Override the default auto flag.")
     timeout_s: float | None = Field(default=None, description="Override the default timeout.")
     variant: str | None = Field(default=None, description="Model variant (reasoning effort).")
     title: str | None = Field(default=None, description="Human-readable task title (defaults to id).")
@@ -214,7 +212,7 @@ Top-level keys:
 
 - `version` (int, default 1)
 - `defaults` (optional mapping), applied to every task unless overridden:
-  - `model`, `agent`, `auto` (bool), `timeout_s` (number), `variant`,
+  - `model`, `agent`, `timeout_s` (number), `variant`,
     `download` (`modified` | `all` | `none`), `env` (map), `files` (list)
   - `requirements` (mapping): worker capabilities every task needs
   - `resources` (list): resources every task materializes (merged with task
@@ -227,7 +225,7 @@ Top-level keys:
   - `id` (required, unique)
   - `prompt` (string) or `prompt_file` (path relative to the plan): required
   - `files` (paths/globs relative to the plan), sent to the worker before it runs
-  - `model`, `agent`, `auto`, `timeout_s`, `variant`, `title`
+  - `model`, `agent`, `timeout_s`, `variant`, `title`
   - `env` (map of extra environment variables for the subprocess)
   - `download` (`modified` | `all` | `none`)
   - `depends_on` (task ids): ordering; the task is skipped if a dependency fails
@@ -266,6 +264,24 @@ Built-in providers:
   prepare; a conflict is resolved by the worker itself (Opencode), not failed.
 - `path` — expose an existing folder: `{path, mode: ro|rw, visible?}`.
 
+Git layout (matters for prompts):
+
+- OpenCode runs from the **job workspace root**.
+- `git` with `worktree: true` checks out the task's **working tree at
+  `<workspace>/src/<resource id>`** and commits/pushes *that* tree. `path` is
+  the durable clone (staging), not the checkout: use an absolute path under
+  `path_roots`, or a relative label (the worker keeps a relative clone out of
+  the workspace so only `src/<id>` is visible).
+- `git` with `worktree: false` (default) checks out in place at `path`; with a
+  relative `path` that is `<workspace>/<path>`.
+- The worker **prepends the working directories to every prompt** (a "[Working
+  environment]" block), but write prompts against the tree anyway: say "the
+  repository is at `./src/<id>`" (worktree) or "`./<path>`" (canonical), not
+  "the workspace root". Point `opencode.agents_paths` / `skills_paths` /
+  `agents_md` at the checkout too (`./src/<id>/.opencode/...`). Getting this
+  wrong is silent: the task edits a tree the provider never commits and
+  `publish: push` reports nothing pushed.
+
 Resource notes:
 
 - Resources merge by `id` across `defaults.resources` and the task: a same-`id`
@@ -274,7 +290,9 @@ Resource notes:
 - A resource whose `type` the worker does not implement fails the task at
   prepare, before OpenCode runs, with a clear error.
 - Absolute paths (`git.path`, `path.path`, `opencode` sources) must live under
-  the worker's `path_roots`; relative paths resolve under the job workspace.
+  the worker's `path_roots`; relative paths resolve under the job workspace
+  (for `git` with `worktree: true`, a relative `path` is only a clone label and
+  is staged outside the workspace — see the Git layout notes above).
 - `{run}` and `{task}` in resource option strings are resolved by the server
   (task-local only). Cross-task references do not exist: to consume another
   task's branch, declare the repo with `ref: "hiveling/{run}/<producer>"` and
@@ -303,7 +321,6 @@ version: 1
 defaults:
   model: opencode-go/deepseek-v4.1-flash
   agent: build
-  auto: true
   timeout_s: 600
 
 tasks:

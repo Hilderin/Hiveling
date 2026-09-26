@@ -57,7 +57,6 @@ class Context:
     opencode_flags: frozenset = frozenset()
     model: str | None = None
     agent: str | None = None
-    auto: bool = True
     timeout_s: float | None = None
     default_timeout_s: float = 900.0
 
@@ -237,6 +236,53 @@ class Environment:
                     prepared.resource.id,
                     exc_info=True,
                 )
+
+
+def summarize_working_dirs(prepared: list[Prepared], workspace: Path) -> str:
+    """A short prompt preamble telling the agent where each resource lives.
+
+    OpenCode runs from the job workspace, but resource working trees do not: a
+    ``git`` resource with ``worktree: true`` is checked out under
+    ``<workspace>/src/<id>`` while the workspace root stays a project shell.
+    Without this note the agent only learns the layout from the plan prompt,
+    which is easy to get wrong and silently lose the edits. Prepending the
+    actual directories removes that class of failure.
+    """
+    lines: list[str] = []
+    for item in prepared:
+        resource = item.resource
+        for entry in item.paths:
+            raw = str(entry.get("path") or "")
+            if not raw:
+                continue
+            path = Path(raw)
+            try:
+                shown = "./" + path.relative_to(workspace).as_posix()
+            except ValueError:
+                shown = path.as_posix()
+            detail = ""
+            if resource.type == "git":
+                bits = []
+                branch = (item.state or {}).get("branch")
+                if branch:
+                    bits.append(f"branch {branch}")
+                bits.append(f"publish {resource.options.get('publish', 'push')}")
+                detail = " (" + ", ".join(bits) + ")"
+            elif resource.type == "path":
+                mode = entry.get("mode") or "rw"
+                detail = f" ({mode})"
+            lines.append(f"- {resource.type} '{resource.id}': {shown}{detail}")
+    if not lines:
+        return ""
+    return (
+        "[Working environment]\n"
+        "OpenCode runs from the job workspace root. Resource working "
+        "directories:\n"
+        + "\n".join(lines)
+        + "\nDo repository file and git operations inside the resource working "
+        "directory, not at the workspace root.\n"
+        "[/Working environment]\n\n"
+    )
 
 
 def emit_event(ctx: Context, event: dict) -> None:

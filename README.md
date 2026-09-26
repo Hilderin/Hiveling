@@ -346,7 +346,6 @@ version: 1
 defaults:                # optional, applied to every task unless overridden
   model: opencode-go/deepseek-v4.1-flash
   agent: build
-  auto: true             # pass --auto to opencode
   timeout_s: 600
   download: modified     # modified | all | none
   requirements:          # only dispatch to a matching worker (see below)
@@ -368,7 +367,6 @@ tasks:
     files: []            # paths/globs relative to the plan, sent to the worker
     model: ...           # optional override
     agent: ...
-    auto: true
     timeout_s: 600
     variant: ...         # model variant (reasoning effort)
     title: ...
@@ -433,11 +431,20 @@ new ids append). Built-in providers:
 
 `git` semantics: `ref` is the **start point** (branch/tag/sha), `branch` is the
 **target** the task commits to, `publish` is `none|commit|push`, `clean` is
-`none|git|full`, `cache` lists paths preserved across a clean. To consume
-another task's branch, declare the same repo with
+`none|git|full`, `cache` lists paths preserved across a clean. `push` requires
+the task to produce something: a task that edits nothing (and merges nothing in
+prepare) **fails** rather than quietly succeeding with an empty branch — use
+`publish: none`/`commit` for review or verification tasks that only read a
+branch. To consume another task's branch, declare the same repo with
 `ref: "hiveling/{run}/<producer>"` and `depends_on: [<producer>]` — there is no
 cross-task substitution. `{run}` and `{task}` in option strings are resolved by
 the server.
+
+`worktree: true` checks the task's working tree out at `<workspace>/src/<id>`
+(the plan's `path` is only the durable clone, staged outside the workspace for a
+relative path); `worktree: false` checks out in place at `path`. Write prompts
+against the checkout — the worker also prepends a `[Working environment]` block
+listing each resource's working directory.
 
 `merge: [refs]` merges the refs into `branch` during prepare, **before** the
 task's OpenCode run. A conflict does not fail the task: the worker resolves it
@@ -490,6 +497,12 @@ Precedence (low → high): worker baseline bundle (`--opencode-dir`, default
 `./opencode`), repo/config provenance reported by `git`/`path`, plan sources,
 then plan inline. Skills are added to the config `skills` array; agents are
 symlinked into `.opencode/agents/`; `AGENTS.md` files are concatenated.
+
+**Permissions come from this config, not from a CLI flag.** The worker does not
+pass `--auto` to `opencode run`: a permission is allowed only if the injected
+config grants it (and the agent's own `permissions` rules). There is no plan
+`auto` option — to allow something, declare it in `opencode.config.permissions`
+or on the agent. This keeps the generated `opencode.json` authoritative.
 
 ### Artifacts
 

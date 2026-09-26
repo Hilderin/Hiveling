@@ -7,7 +7,13 @@ from pathlib import Path
 import pytest
 
 from worker.app import opencode_run
-from worker.app.environment import Context, Environment, EnvironmentError, Resource
+from worker.app.environment import (
+    Context,
+    Environment,
+    EnvironmentError,
+    JobOutcome,
+    Resource,
+)
 
 GIT_ENV = {
     **os.environ,
@@ -136,6 +142,55 @@ def test_conflict_is_resolved_by_opencode(tmp_path, bare_repo, monkeypatch):
     assert "conflict marker" not in subprocess.run(
         ["git", "diff", "--check"], cwd=repo, capture_output=True, text=True, env=GIT_ENV
     ).stdout
+
+
+def test_publish_push_without_changes_fails(tmp_path, bare_repo):
+    """`publish: push` must fail when the task produced nothing.
+
+    Regression: an agent that edits the wrong tree "succeeded" with
+    `pushed: false`, and the consumer then failed with `merge ref not found`.
+    """
+    ctx = make_ctx(tmp_path, tmp_path)
+    resource = Resource(
+        type="git",
+        id="app",
+        options={
+            "repo": str(bare_repo),
+            "path": str(tmp_path / "clone"),
+            "worktree": False,
+            "ref": "main",
+            "branch": "hiveling/r1/t1",
+            "publish": "push",
+        },
+    )
+    env = Environment([resource], ctx)
+    env.prepare()
+    with pytest.raises(EnvironmentError) as exc:
+        env.finalize(JobOutcome(status="succeeded", succeeded=True))
+    assert "nothing to push" in str(exc.value)
+
+
+def test_publish_push_with_a_merge_but_no_edit_succeeds(tmp_path, bare_repo):
+    """A prepare-time `merge` is a real change, so an empty edit still pushes."""
+    make_branch(bare_repo, "feat-a", {"a.txt": "A\n"})
+    ctx = make_ctx(tmp_path, tmp_path)
+    resource = Resource(
+        type="git",
+        id="app",
+        options={
+            "repo": str(bare_repo),
+            "path": str(tmp_path / "clone"),
+            "worktree": False,
+            "ref": "main",
+            "branch": "hiveling/r1/t1",
+            "merge": ["feat-a"],
+            "publish": "push",
+        },
+    )
+    env = Environment([resource], ctx)
+    env.prepare()
+    result = env.finalize(JobOutcome(status="succeeded", succeeded=True))
+    assert result.commits and result.commits[0]["pushed"] is True
 
 
 def test_unresolved_conflict_fails_prepare(tmp_path, bare_repo, monkeypatch):

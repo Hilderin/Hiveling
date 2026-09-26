@@ -25,7 +25,6 @@ class Task:
     files: list[str] = field(default_factory=list)
     model: str | None = None
     agent: str | None = None
-    auto: bool = True
     timeout_s: float | None = None
     variant: str | None = None
     title: str | None = None
@@ -180,7 +179,6 @@ def _parse_task(raw: dict, defaults: dict, base_dir: Path) -> Task:
         files=[str(f) for f in files],
         model=pick("model"),
         agent=pick("agent"),
-        auto=bool(pick("auto", True)),
         timeout_s=float(timeout) if timeout is not None else None,
         variant=pick("variant"),
         title=pick("title") or str(task_id),

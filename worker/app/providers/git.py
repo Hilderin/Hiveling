@@ -174,9 +174,19 @@ class GitProvider:
     # ---------------------------------------------------------------- lifecycle
     def prepare(self, resource: Resource, ctx: Context) -> Prepared:
         options = resource.options
-        repo_path = self._resolve_path(str(options["path"]), ctx)
-        check_path_allowed(repo_path, ctx, label="git")
+        requested_path = str(options["path"])
         worktree = bool(options.get("worktree", False))
+        # With `worktree: true` the durable clone is only a staging area: the task
+        # commits from the per-task worktree under `src/<id>`. Keep a relative
+        # clone outside the job workspace so the agent cannot mistake it for the
+        # checkout: a clone at `<workspace>/<path>` shadows `src/<id>` and
+        # silently swallows the task's edits (nothing is committed or pushed).
+        # Absolute paths keep their meaning (a durable, path_roots-scoped clone).
+        if worktree and not Path(requested_path).expanduser().is_absolute():
+            repo_path = (ctx.job_dir / "repos" / resource.id).resolve()
+        else:
+            repo_path = self._resolve_path(requested_path, ctx)
+            check_path_allowed(repo_path, ctx, label="git")
         ref = str(options.get("ref") or "HEAD")
         branch = self._branch(resource, ctx)
         branch_mode = str(options.get("branch_mode", "create"))
@@ -186,13 +196,18 @@ class GitProvider:
         if clean == "full" and not worktree and repo_path.exists():
             shutil.rmtree(repo_path, ignore_errors=True)
 
+        workdir = (ctx.workspace / "src" / resource.id).resolve() if worktree else repo_path
+        if worktree and workdir == repo_path:
+            raise EnvironmentError(
+                f"git: 'path' ({requested_path}) resolves to the task worktree "
+                f"'{workdir}'; choose a different path or set worktree: false"
+            )
+
         self._ensure_clone(repo_path, str(options["repo"]))
 
         if worktree:
-            workdir = (ctx.workspace / "src" / resource.id).resolve()
             self._add_worktree(repo_path, workdir, branch, ref, branch_mode)
         else:
-            workdir = repo_path
             self._checkout(repo_path, branch, ref, branch_mode, clean, cache)
 
         # Merge the requested refs into the branch. A conflict is resolved by a
@@ -268,7 +283,6 @@ class GitProvider:
                 CONFLICT_PROMPT,
                 model=ctx.model,
                 agent=ctx.agent,
-                auto=ctx.auto,
                 standalone=standalone,
                 timeout_s=timeout,
             )
@@ -415,8 +429,9 @@ class GitProvider:
 
         _git(["add", "-A"], repo, check=False)
         status = _run(["status", "--porcelain"], repo)
+        has_status_changes = bool(status.stdout.strip())
         committed = False
-        if status.stdout.strip():
+        if has_status_changes:
             message = str(
                 options.get("commit_message")
                 or f"hiveling: {ctx.task_id or resource.id}"
@@ -433,6 +448,27 @@ class GitProvider:
         start_sha = str(prepared.state.get("start_sha") or "")
         head = _run(["rev-parse", "HEAD"], repo).stdout.strip()
         moved = bool(start_sha and head and head != start_sha)
+        resolved = bool((prepared.state.get("merge") or {}).get("commits"))
+
+        # A task that asked to push must have something to push. Publishing an
+        # empty branch means the tree the provider commits was not the one the
+        # agent edited (the classic `<workspace>/<path>` vs `<workspace>/src/<id>`
+        # mix-up), so fail instead of silently "succeeding" with nothing on the
+        # remote. A branch advanced by a prepare-time `merge` is a real change;
+        # review/verification tasks that consume a branch and touch nothing
+        # should use `publish: none` (or `commit`).
+        if (
+            publish == "push"
+            and not committed
+            and not moved
+            and not resolved
+        ):
+            raise EnvironmentError(
+                f"git: nothing to push for branch '{branch}' ({repo}); the task "
+                f"made no change. Is the prompt pointing at the checkout "
+                f"('src/{resource.id}' with worktree: true), or should this task "
+                f"use publish: none?"
+            )
 
         if publish == "commit" or (not committed and not moved):
             # Nothing to push, or push not requested.

@@ -42,7 +42,6 @@ class JobSpec(BaseModel):
     prompt: str
     model: str | None = None
     agent: str | None = None
-    auto: bool = True
     timeout_s: float | None = None
     variant: str | None = None
     title: str | None = None
@@ -210,11 +209,10 @@ def create_app(config: Config) -> FastAPI:
         registry.add(job)
         job.save()
         logger.info(
-            "job %s accepted (model=%s agent=%s auto=%s files=%d)",
+            "job %s accepted (model=%s agent=%s files=%d)",
             job_id,
             spec.model,
             spec.agent,
-            spec.auto,
             len(spec.files),
         )
         return job.to_status()

@@ -25,6 +25,7 @@ from .environment import (
     EnvironmentError,
     JobOutcome,
     parse_resources,
+    summarize_working_dirs,
 )
 from .snapshot import diff, snapshot
 from .state import Job
@@ -121,7 +122,9 @@ def _describe_command(command: list[str]) -> str:
     return " ".join([*head, repr(prompt)])
 
 
-def _build_command(binary: str, job: Job, workdir: Path) -> list[str]:
+def _build_command(
+    binary: str, job: Job, workdir: Path, prompt_prefix: str = ""
+) -> list[str]:
     spec = job.spec
     flags = _run_flags(binary)
     command = [binary, "run", "--format", "json"]
@@ -132,8 +135,6 @@ def _build_command(binary: str, job: Job, workdir: Path) -> list[str]:
         command.append("--standalone")
     if "--dir" in flags:
         command += ["--dir", str(workdir)]
-    if spec.get("auto", True):
-        command.append("--auto")
     model = spec.get("model")
     variant = spec.get("variant")
     if variant and "--variant" in flags:
@@ -149,7 +150,7 @@ def _build_command(binary: str, job: Job, workdir: Path) -> list[str]:
         command += ["--title", spec["title"]]
     for extra in spec.get("files") or []:
         command += ["--file", str(extra)]
-    command.append(spec["prompt"])
+    command.append((prompt_prefix or "") + spec["prompt"])
     return command
 
 
@@ -285,7 +286,6 @@ def execute(job: Job, config: Config) -> None:
         opencode_flags=opencode_flags,
         model=job.spec.get("model"),
         agent=job.spec.get("agent"),
-        auto=bool(job.spec.get("auto", True)),
         timeout_s=timeout_s,
         default_timeout_s=config.default_timeout_s,
     )
@@ -357,7 +357,12 @@ def execute(job: Job, config: Config) -> None:
 
     try:
         binary = resolve_binary(config.opencode_bin)
-        command = _build_command(binary, job, workdir)
+        prompt_prefix = (
+            summarize_working_dirs(environment.prepared, workdir)
+            if environment is not None
+            else ""
+        )
+        command = _build_command(binary, job, workdir, prompt_prefix)
         logger.info(
             "job %s: opencode binary %s, flags %s",
             job.job_id,

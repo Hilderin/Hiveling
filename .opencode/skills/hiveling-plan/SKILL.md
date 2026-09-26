@@ -58,6 +58,27 @@ Resources are prepared on the worker **before** OpenCode runs. Built-ins:
 `ephemeral` (fresh dir, default), `env`, `secret`, `path`, `git`, `command`
 (opt-in). See `get_plan_schema` for every `with` option — don't guess them.
 
+### Where the code lives (git layout)
+
+OpenCode runs from the **job workspace root**, but a git checkout usually does
+**not** sit there:
+
+- `worktree: true` → the task's working tree is `<workspace>/src/<resource id>`.
+  The plan's `path` is only the durable clone (staging); the worker keeps a
+  relative `path` out of the workspace so `src/<id>` is the single visible tree.
+- `worktree: false` (default) → checked out in place at `path`; with a relative
+  `path` that is `<workspace>/<path>`.
+
+So write prompts against the tree, e.g. *"the repository is at `./src/repo`;
+read `./src/repo/feature.md` and commit inside it"* — not "the workspace root".
+The same applies to the repo's OpenCode config: point `opencode.agents_paths` /
+`skills_paths` / `agents_md` at the checkout (`./src/repo/.opencode/agents`,
+…) — not at `./repo/...`.
+The worker also prepends a `[Working environment]` block listing every
+resource's working directory to each prompt, but do not rely on it: a wrong path
+in the prompt is **silent** — the agent edits a tree the provider never commits,
+and `publish: push` simply reports nothing pushed.
+
 `opencode` injects an OpenCode config per job; prefer worker-local **paths**
 (`from`, `agents_paths`, `skills_paths`, `agents_md`) over inline Markdown.
 
@@ -99,31 +120,112 @@ Decision rules:
 - **One concern per task.** Small, bounded prompts; let the DAG express the plan.
 - **Branch per task, deterministic:** `branch: "hiveling/{run}/{task}"` +
   `publish: push`. `{run}` and `{task}` are the only substitutions (task-local).
+
+  ```yaml
+  resources:
+    - type: git
+      id: repo
+      with:
+        repo: REPO
+        path: repo                 # durable clone; keep worktree trees under src/<id>
+        worktree: true
+        ref: main
+        branch: "hiveling/{run}/{task}"
+        publish: push
+  ```
+
+  With `worktree: true` the prompt must point at `./src/repo` (see *Where the
+  code lives*). With `worktree: false` it is `./repo`.
+- **`publish: push` is a contract.** The task must produce a change; if it
+  edits nothing (and merges nothing in prepare) the task **fails**. So a
+  read-only task that consumes a branch (review, acceptance, verification) must
+  use `publish: none` (or `commit`) instead. Getting this wrong on a producer is
+  how you catch the wrong-tree mistake early instead of at the consumer.
+- **Permissions come from the injected config, not a flag.** There is no `auto`
+  option and the worker never passes `--auto`. A task may only do what the
+  effective `opencode.json` and its agent `permissions` allow; declare anything
+  extra under `opencode.config.permissions`.
 - **Consume a producer's branch** by naming it + explicit ordering (no magic):
 
   ```yaml
   - id: test
     depends_on: [build]
     resources:
-      - {type: git, id: app, with: {repo: REPO,
+      - {type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
           ref: "hiveling/{run}/build", branch: "hiveling/{run}/test", publish: push}}
   ```
 
+  The consumer's working tree is likewise `./src/repo`.
+
 - **Integrate several branches** with `merge: [refs]` on a git resource: it
-  merges into `branch` during prepare and **resolves conflicts itself** (a
-  nested OpenCode run), committing a merge per ref. Put the tests in that task's
-  prompt, since the merge is already done before it runs. Conflicts and merge
-  commits are visible in the task events and `get_task`.
+  merges into `branch` during prepare (before the task runs) and **resolves
+  conflicts itself** (a nested OpenCode run), committing a merge per ref. Each
+  merged ref must already be pushed, so list its producer in `depends_on`. The
+  prompt must say the merge is already done — the agent works in the merged
+  `./src/repo`, not at `main`:
+
+  ```yaml
+  - id: coder-db                          # parallel work items, both from designer
+    prompt: "Create ./src/repo/app/db.py according to ./src/repo/docs/design.md"
+    depends_on: [designer]
+    resources:
+      - {type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
+          ref: "hiveling/{run}/designer", branch: "hiveling/{run}/coder-db", publish: push}}
+
+  - id: coder-api
+    prompt: "Create ./src/repo/app/server.py according to ./src/repo/docs/design.md"
+    depends_on: [designer]
+    resources:
+      - {type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
+          ref: "hiveling/{run}/designer", branch: "hiveling/{run}/coder-api", publish: push}}
+
+  - id: tester                            # merges both coders into one tree
+    prompt: >
+      This branch already merged coder-db and coder-api during prepare.
+      Write ./src/repo/tests/ and run the suite from inside ./src/repo.
+    depends_on: [coder-db, coder-api]
+    resources:
+      - type: git
+        id: repo
+        with:
+          repo: REPO
+          path: repo
+          worktree: true
+          ref: "hiveling/{run}/coder-db"          # base branch
+          branch: "hiveling/{run}/tester"
+          publish: push
+          merge:
+            - "hiveling/{run}/coder-api"          # merged in during prepare
+  ```
+
+  The base matters: branches that all merge the same `ref` (here `designer`)
+  share it as ancestor, so subsequent merges stay clean. Don't merge two
+  branches that each created the same file from `main` — that is an add/add
+  conflict. Keep the per-task worktree (`./src/repo`) in the prompt even when a
+  merge is involved.
 - **Keep reports**: `artifacts: {paths: ["reports/**"]}` adds globs to the
   downloaded zip; `artifacts: {git: true}` surfaces commits/branches.
 - **Pick the environment** with `requirements` (e.g. `os: windows`, `tags:
   [mssql]`); a follow-up can run on a different OS as long as it consumes a
   pushed branch.
 
+Read-only consumers (review, verification, acceptance) still run in the tree
+they consume and usually write nothing; give them `publish: none` so they don't
+have to satisfy the push contract.
+
 ## Pitfalls
 
 - Assuming tasks share a working directory: they don't. Use `inputs_from`
   (files) or a `git` resource (code) to pass work along.
+- Pointing prompts at the workspace root instead of the checkout. With
+  `worktree: true` the tree is `./src/<id>`; each `git` resource exposes exactly
+  that tree (the worker also prepends a `[Working environment]` block). A wrong
+  path is **not** silent any more: `publish: push` fails with "nothing to push"
+  — the fix is to point the prompt at the checkout (or use `publish: none` for
+  a read-only task).
+- Using `publish: push` on a task that does not modify the branch. Reading a
+  consumed branch and writing no file is a failure unless you set
+  `publish: none`/`commit`.
 - Using a path not under the worker's `path_roots` (see `list_workers`).
 - `command` (arbitrary shell) is refused unless the worker advertises it.
 - Long prompts are command-line arguments on the worker (Windows has limits):
@@ -136,7 +238,10 @@ Decision rules:
 1. `get_plan_schema()` and `list_workers()` called.
 2. Every task has a unique `id` and a `prompt`/`prompt_file`.
 3. Requirements match advertised capabilities; paths under `path_roots`.
-4. Consumers list their producers in `depends_on`.
-5. No secret value in the plan; no invented path or worker.
-6. Run, then `wait_for_run(until="terminal")`; on failure `get_task` →
+4. Prompts reference the checkout (`./src/<id>` with `worktree: true`, else
+   `./<path>`), not the workspace root.
+5. Read-only tasks (review/verification) use `publish: none`; producers push.
+6. Consumers list their producers in `depends_on`.
+7. No secret value in the plan; no invented path or worker.
+8. Run, then `wait_for_run(until="terminal")`; on failure `get_task` →
    `update_run_plan` → `resume_run`; `cancel_run` to abort.
