@@ -11,6 +11,8 @@ agents' own instructions stay generic.
 | `analyst-reviewer` | analysis review | subagent (read-only) | findings + `VERDICT: APPROVED` / `VERDICT: CHANGES_REQUESTED: …` |
 | `architect` | design | primary | interfaces, data model, files, decisions, test seams, risks |
 | `architect-reviewer` | design review | subagent (read-only) | findings + `VERDICT: …` |
+| `designer` | UX/UI design | all | screens, flows, states, copy, layout, accessibility |
+| `designer-reviewer` | design review | subagent (read-only) | findings + `VERDICT: …` |
 | `coder` | implementation | primary | the change, verified with the project's own test command |
 | `tester` | tests | all | automated tests, green suite |
 | `reviewer` | code review | all (read-only) | findings + `VERDICT: …` |
@@ -46,9 +48,17 @@ tasks:
     agent: architect
     depends_on: [review-analysis]
     prompt: "Design the change for <ticket>."
+  - id: design-ui      # designer (only when a UI is involved)
+    agent: designer
+    depends_on: [design]
+    prompt: "Design the UI for <ticket>."
+  - id: review-ui      # designer-reviewer
+    agent: designer-reviewer
+    depends_on: [design-ui]
+    prompt: "Review the UI design for <ticket>."
   - id: implement      # coder (one or more parallel tasks)
     agent: coder
-    depends_on: [design]
+    depends_on: [design, review-ui]
     prompt: "Implement <work item>."
   - id: test           # tester
     agent: tester
