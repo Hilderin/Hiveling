@@ -130,6 +130,50 @@ def test_provider_fragment_is_merged(tmp_path):
     assert config["permissions"][0]["resource"] == "/x/**"
 
 
+def test_repo_config_overrides_baseline_and_plan_overrides_repo(tmp_path):
+    baseline = tmp_path / "base"
+    baseline.mkdir()
+    (baseline / "opencode.json").write_text(
+        '{"model": "base", "theme": "dark"}\n', encoding="utf-8"
+    )
+    repo = tmp_path / "repo"
+    (repo / ".opencode").mkdir(parents=True)
+    (repo / ".opencode" / "opencode.json").write_text(
+        '{"model": "repo", "agent": "build"}\n', encoding="utf-8"
+    )
+    c = make_ctx(tmp_path)
+    inject(
+        c.workspace,
+        plan_opencode={"config": {"model": "plan"}},
+        baseline_dir=baseline,
+        provenance=[(repo, False)],
+        fragments=[],
+        ctx=c,
+    )
+    config = json.loads((c.workspace / "opencode.json").read_text(encoding="utf-8"))
+    assert config["model"] == "plan"   # plan wins
+    assert config["theme"] == "dark"   # baseline retained
+    assert config["agent"] == "build"  # repo retained
+
+
+def test_permissions_are_concatenated_across_layers(tmp_path):
+    c = make_ctx(tmp_path)
+    fragments = [
+        {"permissions": [{"action": "external_directory", "resource": "/x/**", "effect": "allow"}]}
+    ]
+    inject(
+        c.workspace,
+        plan_opencode={"config": {"permissions": [{"action": "edit", "resource": "*", "effect": "allow"}]}},
+        baseline_dir=None,
+        provenance=[],
+        fragments=fragments,
+        ctx=c,
+    )
+    config = json.loads((c.workspace / "opencode.json").read_text(encoding="utf-8"))
+    resources = [rule["resource"] for rule in config["permissions"]]
+    assert "*" in resources and "/x/**" in resources
+
+
 def test_source_outside_path_roots_fails(tmp_path):
     c = make_ctx(tmp_path, roots=[str(tmp_path / "allowed")])
     outside = tmp_path / "outside"

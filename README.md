@@ -325,6 +325,9 @@ HIVELING_TOKEN=choose-a-secret \
 Related dashboard flags:
 
 - `--workers-file`: workers configuration file (default `<data-dir>/workers.yaml`).
+- `--history-retention-runs` / `--history-retention-days`: prune old finished
+  runs and their history on startup (off by default; see
+  [Garbage collection](#garbage-collection)).
 - `--mcp-token` (default `$HIVELING_TOKEN`): bearer token required on `/mcp`;
   empty disables authentication.
 - `--mcp-allowed-host` (repeatable): extra `Host` accepted by the MCP
@@ -491,6 +494,34 @@ is refused. `command` runs arbitrary shell commands and is **not** advertised by
 default; list it explicitly to enable it. Migrate absolute paths to
 `path_roots` so plans cannot reach outside them (`path_roots: ["*"]` disables
 the check explicitly).
+
+OpenCode config layers merge **deeply** (nested objects are merged, not
+replaced); `permissions`, `skills` and `plugins` lists are concatenated so every
+layer's rules survive. Precedence, low to high: worker `opencode/` bundle → repo
+config (`opencode.json`, `.opencode/`, `AGENTS.md` of a `git`/`path` resource) →
+plan sources → plan inline.
+
+## Garbage collection
+
+Every job gets its own directory under the worker workspace, so finished jobs
+would grow forever. GC removes **terminal** jobs only; running/accepted jobs are
+never touched. Two independent criteria, both off by default:
+
+- `--retention-jobs N` (env `WORKER_RETENTION_JOBS`): keep only the newest N
+  finished jobs on the worker (runs at startup, then hourly);
+- `--retention-days D` (env `WORKER_RETENTION_DAYS`): also remove finished jobs
+  older than D days.
+
+A one-shot command prunes on demand:
+
+```bash
+python worker/gc.py --workspace .data/worker --keep 20 --days 7
+```
+
+On the server, finished runs and their history are pruned with
+`dashboard.py --history-retention-runs N` / `--history-retention-days D`
+(env `HIVELING_RETENTION_RUNS` / `HIVELING_RETENTION_DAYS`), applied at startup.
+Both are off by default.
 
 ## `workers.yaml` reference
 

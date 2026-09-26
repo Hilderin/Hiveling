@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import uvicorn  # noqa: E402
 
+from app.gc import prune_runs  # noqa: E402
 from app.logging_setup import log_shutdown, log_startup, setup_logging  # noqa: E402
 from app.web import DashboardConfig, RunManager, create_app  # noqa: E402
 
@@ -70,6 +71,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "wait_for_run need this to exceed the wait (default: 300)",
     )
     parser.add_argument(
+        "--history-retention-runs",
+        type=int,
+        default=int(os.environ.get("HIVELING_RETENTION_RUNS", "0")),
+        help="keep only the newest N finished runs (0 disables, default)",
+    )
+    parser.add_argument(
+        "--history-retention-days",
+        type=float,
+        default=float(os.environ.get("HIVELING_RETENTION_DAYS", "0")),
+        help="also remove finished runs older than N days (0 disables, default)",
+    )
+    parser.add_argument(
         "--mcp-token",
         default=os.environ.get("HIVELING_TOKEN"),
         help="bearer token required on /mcp (default: $HIVELING_TOKEN; empty disables auth)",
@@ -119,6 +132,14 @@ def main(argv: list[str] | None = None) -> None:
     )
     config.history_dir.mkdir(parents=True, exist_ok=True)
     config.runs_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.history_retention_runs > 0 or args.history_retention_days > 0:
+        prune_runs(
+            config.runs_dir,
+            config.history_dir,
+            keep=args.history_retention_runs,
+            older_than_days=args.history_retention_days,
+        )
 
     log_startup(
         host=args.host,

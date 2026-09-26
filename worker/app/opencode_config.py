@@ -96,14 +96,40 @@ def _read_config(path: Path) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+# Lists under these keys are concatenated (deduplicated, order preserved) when
+# merging layers, instead of being replaced. This keeps permission rules from
+# several layers (worker baseline, repo, plan, providers) and every skill/plugin
+# declared along the way.
+_ADDITIVE_KEYS = {"permissions", "skills", "plugins"}
+
+
 def _deep_merge(base: dict, over: dict) -> dict:
+    """Recursively merge ``over`` onto ``base`` (later layers win)."""
     merged = dict(base)
     for key, value in over.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge(merged[key], value)
+        current = merged.get(key)
+        if isinstance(value, dict) and isinstance(current, dict):
+            merged[key] = _deep_merge(current, value)
+        elif (
+            isinstance(value, list)
+            and isinstance(current, list)
+            and key in _ADDITIVE_KEYS
+        ):
+            combined = list(current)
+            for item in value:
+                if item not in combined:
+                    combined.append(item)
+            merged[key] = combined
         else:
             merged[key] = value
     return merged
+
+
+def _merge_into(target: dict, over: dict) -> None:
+    """In-place :func:`_deep_merge` (keeps the caller's dict identity)."""
+    merged = _deep_merge(target, over)
+    target.clear()
+    target.update(merged)
 
 
 @dataclass
@@ -256,7 +282,7 @@ def inject(
     def add_root(root: Path, *, bundle: bool, priority: int) -> None:
         configs, agents, skills, md = _collect(root, bundle=bundle)
         for path in configs:
-            config.update(_read_config(path))
+            _merge_into(config, _read_config(path))
         for path in agents:
             agent_dirs.append((priority, path))
         for path in skills:
@@ -272,7 +298,7 @@ def inject(
     for root, under_location in provenance:
         configs, agents, skills, md = _collect(root, bundle=False)
         for path in configs:
-            config.update(_read_config(path))
+            _merge_into(config, _read_config(path))
         for path in agents:
             agent_dirs.append((0, path))
         for path in skills:
@@ -298,9 +324,9 @@ def inject(
         configs, agents, skills, md = _collect(path, bundle=source.kind == "bundle")
         if source.kind == "config":
             for config_path in configs:
-                config.update(_read_config(config_path))
+                _merge_into(config, _read_config(config_path))
             if path.is_file():
-                config.update(_read_config(path))
+                _merge_into(config, _read_config(path))
         elif source.kind == "agents":
             agent_dirs.append((priority, path))
         elif source.kind == "skills":

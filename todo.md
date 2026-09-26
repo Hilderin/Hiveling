@@ -2,9 +2,7 @@
 
 ## Open
 
-- Worker workspace GC / history retention (prune old job dirs and worktrees)
 - Git integration/merge between worker branches (conflict handling)
-- Plan-authoring skill/docs so an assistant emits explicit Hiveling plans
 - Goal mode / finish_check_prompt / checks
 - Versioned plan mutations
 - Add a task to a plan
@@ -27,3 +25,6 @@
 - git / env / secret / path / command providers (Stages 2-3)
 - Git artifact channel: cross-task branches via resources + artifacts.paths
   (Stage 4)
+- Worker workspace GC / history retention (`worker/gc.py`, retention flags)
+- Repo config override with deep merge + additive permission lists
+- Plan-authoring skill (`.opencode/skills/hiveling-plan/`)

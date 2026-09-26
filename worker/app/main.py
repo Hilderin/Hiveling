@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 
 from .capabilities import Capabilities
 from .config import Config
+from .gc import prune as prune_jobs
 from .executor import execute, _terminate
 from .files import build_zip, extract_zip, list_files, list_globs
 from .secrets import SecretStore
@@ -60,8 +61,17 @@ def _janitor(registry: Registry, config: Config, stop: threading.Event) -> None:
     if config.heartbeat_s > 0:
         interval = min(interval, max(0.5, config.heartbeat_s))
     last_heartbeat = time.time()
+    last_gc = time.time()
+    gc_enabled = config.retention_jobs > 0 or config.retention_days > 0
     while not stop.wait(interval):
         now = time.time()
+        if gc_enabled and now - last_gc >= 3600:
+            last_gc = now
+            prune_jobs(
+                config.workspace,
+                keep=config.retention_jobs,
+                older_than_days=config.retention_days,
+            )
         for job in registry.all():
             if job.status == "accepted" and now - job.created_at > config.accept_timeout_s:
                 job.status = "failed"
@@ -110,6 +120,12 @@ def create_app(config: Config) -> FastAPI:
             config.capabilities_file,
             capabilities.get(),
         )
+        if config.retention_jobs > 0 or config.retention_days > 0:
+            prune_jobs(
+                config.workspace,
+                keep=config.retention_jobs,
+                older_than_days=config.retention_days,
+            )
         try:
             yield
         finally:
