@@ -79,7 +79,65 @@ curl -s 127.0.0.1:8787/health          # busy? active_job? capabilities
 curl -s 127.0.0.1:8080/api/workers     # every worker, reachable/busy, capabilities
 curl -s 127.0.0.1:8080/api/runs/<run_id>
 grep -a heartbeat .data/logs/worker.log | tail -1   # is the worker alive?
+# reach a remote worker port directly (firewall vs process):
+timeout 3 bash -c 'echo > /dev/tcp/10.0.0.174/8787' && echo open || echo blocked
 ```
+
+### Restarting to pick up a code change
+
+The server and workers load their Python at start; only `capabilities.yaml`,
+`secrets.yaml` and the OpenCode bundle are hot-reloaded. **Any change under
+`server/` or `worker/` needs a restart of every process that runs it** — a
+running process silently keeps the old code.
+
+- server (Linux): stop `server/dashboard.py`, start it again on `:8080`;
+- worker (Linux): stop `worker/run.py`, start it again;
+- Windows workers: see below.
+
+Verify with `curl -s 127.0.0.1:8080/api/workers`: every worker must be
+`reachable: true`. A worker that answers locally but is `reachable: false` from
+the server is a firewall/session problem (below), not a code problem.
+
+### Windows workers over SSH
+
+Layout: repo `C:\Projects\Hiveling`, venv
+`C:\Projects\Hiveling\.venv\Scripts\python.exe`, workers on `8787-8789`. SSH
+reaches the box as `ssh hiveling-win` (user `si_z_`, key `~/.ssh/hiveling_win`).
+
+1. **Update the code first** (the workers import from that checkout):
+
+   ```bash
+   ssh hiveling-win 'cmd /c "cd /d C:\Projects\Hiveling && git pull"'
+   ```
+
+2. **Restart — and detach.** OpenSSH on Windows puts the session in a job object
+   and kills the whole process tree when the session closes, so a worker started
+   directly over SSH **dies as soon as the SSH command returns** (it answers
+   `/health` for a second, then vanishes, with no shutdown line in
+   `console.err.log`). `start-multi.ps1` calls `Start-Process`, which is *not*
+   enough over SSH. Launch it through WMI so the parent is `WmiPrvSE`, not the
+   SSH shell:
+
+   ```bash
+   ssh hiveling-win 'powershell -NoProfile -Command "([wmiclass]''Win32_Process'').Create(''powershell -NoProfile -ExecutionPolicy Bypass -File C:\Projects\Hiveling\worker\start-multi.ps1'')"'
+   ```
+
+   Then `-Action Status` / `-Action Stop` via `ssh hiveling-win 'powershell -File
+   C:\Projects\Hiveling\worker\start-multi.ps1 -Action Status'`.
+
+   For a durable start that survives logout/reboot, use a **logon scheduled
+   task** running that script in the user's own session (see README → Windows
+   worker); never a session-0 service.
+
+3. **Firewall.** The workers bind `0.0.0.0`, but Windows Firewall blocks inbound
+   8787-8789 by default. If `/health` answers on the worker but the server still
+   reports `reachable: false` (a direct `/dev/tcp` probe times out), allow the
+   ports from the server host (`10.0.0.120` here):
+
+   ```bash
+   ssh hiveling-win 'powershell -NoProfile -Command "New-NetFirewallRule -Name Hiveling-Workers -DisplayName ''Hiveling workers (8787-8789)'' -Direction Inbound -Protocol TCP -LocalPort 8787-8789 -RemoteAddress 10.0.0.120 -Action Allow"'
+   ```
+
 
 ## 4. Debugging workflow (follow in order)
 
@@ -113,6 +171,7 @@ grep -a heartbeat .data/logs/worker.log | tail -1   # is the worker alive?
 | Task `succeeded` but consumer fails `merge ref not found` / `ref not found` | the producer pushed nothing (see previous line), or the consumer's ref is misspelled / lacks `depends_on`. |
 | `opencode` finds no files / edits the wrong place | the prompt points at the workspace root instead of the checkout (`./src/<id>`); the worker prepends a `[Working environment]` block — read it in `events.jsonl`. |
 | `worker unreachable` after N tries | worker restarted or network; the job is lost (a worker restart fails its in-flight job). |
+| `/api/workers` says `reachable: false` but the worker's `/health` answers locally | Windows: inbound 8787-8789 blocked by the firewall, or the worker was started over SSH and died on disconnect — see §3 *Windows workers over SSH*. |
 | Task `failed` with `timeout after Ns` | raise `timeout_s`; check the opencode process was terminated (logs) — long prompts on Windows hit CLI length limits. |
 | Task failed, log has `permission requested: external_directory (…); auto-rejecting` | a non-interactive `opencode run` auto-rejects an `ask` permission, typically when an agent writes outside the job workspace (the OS temp dir on Windows). The worker already grants the platform temp dir by default; for other external paths declare `external_directory` rules in `opencode.config.permissions` (or the agent's own `permissions`), or make the task read-only (`publish: none`). |
 | Run stuck, no worker free | `max_parallel`/one-job-per-worker; a worker is `busy`; check `/health`. |
