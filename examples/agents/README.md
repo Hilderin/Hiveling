@@ -14,6 +14,7 @@ agents' own instructions stay generic.
 | `coder` | implementation | primary | the change, verified with the project's own test command |
 | `tester` | tests | all | automated tests, green suite |
 | `reviewer` | code review | all (read-only) | findings + `VERDICT: …` |
+| `product-owner` | final acceptance | all (read-only) | each criterion PASS/FAIL/UNVERIFIED + `VERDICT: APPROVED` / `VERDICT: REJECTED: …` |
 
 ## How to use them
 
@@ -57,9 +58,15 @@ tasks:
     agent: reviewer
     depends_on: [test]
     prompt: "Review the change for <ticket>."
+  - id: accept         # product-owner — final gate
+    agent: product-owner
+    depends_on: [review, integrate]   # after everything is merged
+    prompt: "Accept or reject <ticket>: verify each acceptance criterion."
 ```
 
-The `*-reviewer` / `reviewer` agents produce a **verdict in their result**, not
-a process gate: the orchestrator reads it with `get_task` and either accepts the
-phase or feeds the findings back (`update_run_plan` + `resume_run`). See the
+The `*-reviewer` / `reviewer` / `product-owner` agents produce a **verdict in
+their result**, not an automatic process gate: the orchestrator reads it with
+`get_task` and either accepts the phase or feeds the findings back
+(`update_run_plan` + `resume_run`). `product-owner` is the final gate and must
+run last, on the fully merged result, after every other phase. See the
 `hiveling-plan` skill for the full loop.
