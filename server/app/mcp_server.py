@@ -337,11 +337,17 @@ def create_mcp_server(manager, config) -> MCPServer:
             "events": "",
             "event_lines": 0,
             "stderr": "",
+            "commits": list(state.get("commits") or []),
+            "artifacts": list(state.get("artifacts") or []),
         }
         directory = history_dir_for(run, task_id)
         if directory and directory.is_dir():
             detail["status"] = read_json(directory / "status.json")
             detail["request"] = read_json(directory / "request.json")
+            if detail["status"].get("commits"):
+                detail["commits"] = detail["status"]["commits"]
+            if detail["status"].get("artifacts"):
+                detail["artifacts"] = detail["status"]["artifacts"]
             result_path = directory / "result.txt"
             detail["result"] = (
                 result_path.read_text(encoding="utf-8") if result_path.is_file() else ""

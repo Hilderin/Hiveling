@@ -243,7 +243,9 @@ Top-level keys:
     provider-specific options. Resources are validated and prepared on the
     worker *before* OpenCode starts.
   - `artifacts` (mapping): `download` (`modified`|`all`|`none`) selects the zip
-    channel; `git` and `paths` are reserved for later stages.
+    channel; `paths` (globs, relative to the working directory) adds extra files
+    to the zip beyond the workdir diff; `git: true` keeps the commits/branches a
+    `git` resource published in the task result (also returned by get_task).
   - `opencode` (mapping, merged over defaults): OpenCode runtime config injected
     at the job's working directory. Either inline (`config`, `agents`,
     `skills`) or **worker-local paths** (`from` bundles, `agents_paths`,
@@ -273,8 +275,9 @@ Resource notes:
 - Absolute paths (`git.path`, `path.path`, `opencode` sources) must live under
   the worker's `path_roots`; relative paths resolve under the job workspace.
 - `{run}` and `{task}` in resource option strings are resolved by the server
-  (task-local only). Cross-task references do not exist: write the producer's
-  branch name and list it in `depends_on`.
+  (task-local only). Cross-task references do not exist: to consume another
+  task's branch, declare the repo with `ref: "hiveling/{run}/<producer>"` and
+  list it in `depends_on`.
 
 Notes:
 

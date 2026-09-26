@@ -56,6 +56,8 @@ def build_task_states(plan, only: list[str] | None = None) -> list[dict]:
                 "skip_reason": None,
                 "attempts": 0,
                 "changed_files": [],
+                "commits": [],
+                "artifacts": [],
             }
         )
     return states

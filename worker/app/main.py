@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 from .capabilities import Capabilities
 from .config import Config
 from .executor import execute, _terminate
-from .files import build_zip, extract_zip, list_files
+from .files import build_zip, extract_zip, list_files, list_globs
 from .secrets import SecretStore
 from .state import ACTIVE_STATUSES, TERMINAL_STATUSES, Job, Registry
 
@@ -250,6 +250,9 @@ def create_app(config: Config) -> FastAPI:
             files = list_files(job.workdir)
         elif which == "modified":
             files = sorted(set(job.added) | set(job.modified))
+            # Extra artifacts the plan asked for, beyond the workdir diff.
+            patterns = (job.spec.get("artifacts") or {}).get("paths") or []
+            files = sorted(set(files) | set(list_globs(job.workdir, patterns)))
         else:
             raise HTTPException(status_code=400, detail="which must be 'modified' or 'all'")
         data = build_zip(job.workdir, files)

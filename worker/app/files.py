@@ -44,6 +44,24 @@ def build_zip(root: Path, files: list[str]) -> bytes:
     return buffer.getvalue()
 
 
+def list_globs(root: Path, patterns: list[str]) -> list[str]:
+    """Return the files under ``root`` matching ``patterns`` (relative paths)."""
+    import glob
+
+    found: list[str] = []
+    base = root.resolve()
+    for pattern in patterns:
+        for match in glob.glob(str(root / pattern), recursive=True):
+            path = Path(match)
+            if not path.is_file():
+                continue
+            try:
+                found.append(path.resolve().relative_to(base).as_posix())
+            except ValueError:
+                continue
+    return sorted(set(found))
+
+
 def list_files(root: Path) -> list[str]:
     """List every file under ``root`` (relative POSIX paths)."""
     from .snapshot import _is_excluded

@@ -48,6 +48,8 @@ class TaskResult:
     files: list[str] = field(default_factory=list)
     history_rel: str | None = None
     error: str | None = None
+    commits: list = field(default_factory=list)
+    artifacts: list = field(default_factory=list)
 
 
 class Orchestrator:
@@ -818,6 +820,8 @@ class Orchestrator:
             changed_files=result.files,
             history_rel=result.history_rel,
             error=result.error,
+            commits=result.commits,
+            artifacts=result.artifacts,
         )
         return result
 
@@ -940,6 +944,8 @@ class Orchestrator:
             files=sorted(set(status.get("added", [])) | set(status.get("modified", []))),
             history_rel=directory.relative_to(self.history.root).as_posix(),
             error=status.get("error"),
+            commits=list(status.get("commits") or []),
+            artifacts=list(status.get("artifacts") or []),
         )
 
     def _poll(self, client: WorkerClient, job_id: str, task: Task) -> dict:
@@ -1092,6 +1098,12 @@ class Orchestrator:
         )
         if files:
             self.console.print(f"  changed files: {', '.join(files)}")
+        for commit in status.get("commits") or []:
+            action = "pushed" if commit.get("pushed") else "committed"
+            self.console.print(
+                f"  [dim]{action} {commit.get('branch')} "
+                f"@ {str(commit.get('sha') or '')[:8]}[/]"
+            )
         if status.get("error"):
             self.console.print(f"  [red]error:[/] {status['error']}")
         self.console.print(f"  [dim]history: {self._display(directory)}[/]")
