@@ -361,7 +361,7 @@ defaults:                # optional, applied to every task unless overridden
   resources:             # what to materialize on the worker before OpenCode runs
     - type: git
       id: app
-      with: {repo: "...", path: "...", worktree: true, ref: main, branch: "hiveling/{run}/{task}", publish: push}
+      with: {repo: "...", path: "...", worktree: true, ref: main, branch: "hiveling/{run}", publish: push}
   artifacts:
     download: modified
   opencode:              # OpenCode runtime config injected for every task
@@ -437,15 +437,18 @@ new ids append). Built-in providers:
 | `command` | `prepare`, `finalize`, `shell?`, `env?`, `cwd?`, `timeout_s?` | **Opt-in** escape hatch: shell commands around the run. |
 
 `git` semantics: `ref` is the **start point** (branch/tag/sha), `branch` is the
-**target** the task commits to, `publish` is `none|commit|push`, `clean` is
+**target** the task commits to. `branch_mode` (default `auto`) **resumes**
+`branch` when it already exists on the remote and only falls back to `ref` when
+it does not; use `recreate` to discard it and start from `ref` again, or `reuse`
+to require it. A run's tasks share one branch (`branch: "hiveling/{run}"`), so a
+consumer just depends on the producer (or its gate) and already has its files —
+no `ref` plumbing. A task that runs in parallel on a genuinely separate line sets
+its own explicit `branch`. `publish` is `none|commit|push`, `clean` is
 `none|git|full`, `cache` lists paths preserved across a clean. `push` requires
-the task to produce something: a task that edits nothing (and merges nothing in
-prepare) **fails** rather than quietly succeeding with an empty branch — use
-`publish: none`/`commit` for review or verification tasks that only read a
-branch. To consume another task's branch, declare the same repo with
-`ref: "hiveling/{run}/<producer>"` and `depends_on: [<producer>]` — there is no
-cross-task substitution. `{run}` and `{task}` in option strings are resolved by
-the server.
+the task to produce something: a fresh branch whose task edits nothing (and
+merges nothing in prepare) **fails** rather than quietly succeeding with an empty
+branch — use `publish: none`/`commit` for review or verification tasks that only
+read. `{run}` and `{task}` in option strings are resolved by the server.
 
 `worktree: true` checks the task's working tree out at `<workspace>/src/<id>`
 (the plan's `path` is only the durable clone, staged outside the workspace for a
@@ -487,7 +490,10 @@ A **gate** is an optional, read-only checkpoint over one or more tasks. It runs
 after those tasks succeed and answers with a standalone `VALID` line, or with
 the corrections it requires. Without `VALID`, the analysed tasks and the gate
 are reset and re-run; after `max_attempts` (default 20) the gate fails and the
-run stops (fail-fast). This is how a review becomes a *gate* instead of
+run stops (fail-fast). Every task of the run shares one branch (`branch:
+"hiveling/{run}"`), so a re-run **resumes that branch** — the producer sees its
+previous artifact *and* the reviewer's report and fixes it, then the reviewer
+re-inspects the updated tree. This is how a review becomes a *gate* instead of
 decoration: the plan cannot proceed to the gate's consumers until it passes.
 
 ```yaml
@@ -495,12 +501,12 @@ tasks:
   - id: designer
     prompt: "Produce docs/ui-design.md and commit."
     resources: [{type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
-                 ref: main, branch: "hiveling/{run}/{task}", publish: push}}]
+                 ref: main, branch: "hiveling/{run}", publish: push}}]
   - id: coder                          # consumes the approved design
     prompt: "Implement docs/ui-design.md."
     depends_on: [designer-gate]        # depend on the GATE, not on designer
     resources: [{type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
-                 ref: "hiveling/{run}/designer", publish: push}}]
+                 ref: main, branch: "hiveling/{run}", publish: push}}]
 
 gates:
   - id: designer-gate

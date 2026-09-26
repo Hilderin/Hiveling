@@ -296,31 +296,35 @@ server before dispatch:
 | `{run}` | the run id |
 | `{task}` | the current task id |
 
-They exist mainly to build unique branch names, e.g.
-`branch: "hiveling/{run}/{task}"`. They are local to the task; there is **no
-cross-task substitution**.
+They exist mainly to build the run's shared branch name,
+`branch: "hiveling/{run}"` (or an explicit per-line name). They are local to the
+task; there is **no cross-task substitution**.
 
-**Dependencies are always explicit.** Consuming another task's output means
-writing that task's predictable branch name and listing the dependency:
+**One branch per run.** Every task of a run declares the same `branch:
+"hiveling/{run}"`. The first task creates it from `ref`; the others resume it
+(`branch_mode: auto`), so a consumer, a reviewer and a gate re-run all reopen the
+same tree and see each other's commits. **Dependencies are always explicit**
+(`depends_on` carries the ordering), but no `ref` plumbing is needed:
 
 ```yaml
 tasks:
   - id: build
     resources:
-      - {type: git, with: {repo: REPO, ref: develop,
-                           branch: "hiveling/{run}/build", publish: push}}
+      - {type: git, with: {repo: REPO, ref: main,
+                           branch: "hiveling/{run}", publish: push}}
   - id: test
-    depends_on: [build]                                   # explicit ordering
+    depends_on: [build]                # explicit ordering; same branch, resumed
     resources:
-      - {type: git, with: {repo: REPO,
-                           ref: "hiveling/{run}/build",   # the producer's branch
-                           branch: "hiveling/{run}/test", publish: push}}
+      - {type: git, with: {repo: REPO, ref: main,
+                           branch: "hiveling/{run}", publish: push}}
 ```
 
 Rationale: a task has **no `branch` property** — it may declare several `git`
 resources, each with its own branch — so a `{task.branch}` reference would be
 ambiguous. Branch names are therefore written out in the plan and `depends_on`
-carries the ordering, keeping the graph fully readable.
+carries the ordering, keeping the graph fully readable. A task that must run on
+a genuinely independent line sets its own explicit `branch` (and a consumer
+integrates it with `merge: [<line>]`).
 
 `{...}` is distinct from the `env` provider's `${ENV}` expansion; resource option
 values are otherwise literal.
@@ -351,9 +355,9 @@ legacy multi-repo idea.
     repo: git@github.com:acme/app.git
     path: /src/app                  # absolute, or relative to the location dir
     worktree: false                 # default; true = per-task worktree (parallel)
-    ref: develop                    # START point (branch/tag/sha)
-    branch: "hiveling/{run}/{task}" # TARGET branch the task commits/pushes to
-    branch_mode: create             # create | reuse | recreate
+    ref: develop                    # START point when the branch does not exist
+    branch: "hiveling/{run}"        # TARGET branch (one per run, shared)
+    branch_mode: auto               # auto | create | reuse | recreate
     push_to: null                   # remote ref to push (default: same as branch)
     set_upstream: true              # pass -u on push
     force: false                    # never force-push unless explicit
@@ -368,21 +372,23 @@ Semantics:
 - **`ref` vs `branch`.** `ref` is the **start point** (any branch, tag or sha).
   `branch` is the **target branch** the task commits to. They are independent,
   so "branch from `develop`, push to my own branch" is simply `ref: develop` +
-  `branch: hiveling/{run}/{task}`.
-- **`branch_mode`.** `create` (default) makes `branch` from `ref` and fails if
-  it already exists; `reuse` fetches and checks out the existing `branch` so the
-  task's commits stack on top (a non-force push is then fast-forward only);
-  `recreate` deletes the local branch and re-creates it from `ref`.
+  `branch: hiveling/{run}/my-line`.
+- **`branch_mode`.** `auto` (default) **resumes** `branch` when it already
+  exists (local or `origin/<branch>`), stacking the task's commits on top, and
+  creates it from `ref` otherwise; `create` fails if the branch already exists;
+  `reuse` requires it to exist; `recreate` discards it and re-creates from `ref`
+  (a later push needs `force: true`). Because every task of a run shares one
+  branch, `auto` is what lets reviewers and gate re-runs reopen the tree.
 - **canonical clone model** (`worktree: false`): the provider owns a durable
   clone at `path` (clone if missing, `git fetch`), then checks out `ref` /
   `branch`, optionally `clean`. OpenCode works in place. Used for legacy
   multi-repo where absolute paths matter.
 - **worktree model** (`worktree: true`, opt-in): a durable bare/clone lives at
   `path` (or under the worker's cache dir); the provider creates a per-task
-  worktree from `ref` on `branch` under the location dir, so parallel tasks on
-  the same repo never collide and canonical paths are untouched. Use it when
-  several tasks touch one repo in parallel; the default is `false` (canonical
-  clone / in-place).
+  worktree on `branch` under the location dir — resuming `origin/<branch>` when
+  it exists, else creating it from `ref` — so tasks never collide and canonical
+  paths are untouched. Use it when several tasks touch one repo; the default is
+  `false` (canonical clone / in-place).
 - **publish**: at finalize, `commit` creates a commit on `branch` from changed
   files; `push` also pushes it to `remote` — to `push_to` if set, otherwise to
   the same-named branch. `set_upstream: true` adds `-u`. `force` defaults to
@@ -709,23 +715,24 @@ artifacts:
 
 ### 10.1 Git flows through resources, not `inputs_from`
 
-Producing and consuming a git ref is expressed with **resources only**: the
-consumer declares the same repo with `ref` referencing the producer task (7.5),
-and the dependency is implied. A git variant of `inputs_from` would duplicate
-the resource model for no benefit — the resource already names the repo and the
-ref, which is simpler and more explicit.
+Producing and consuming git work is expressed with **resources only**: every
+task of a run declares the same shared `branch: "hiveling/{run}"`, so the
+consumer resumes the producer's tree and only `depends_on` carries the ordering
+(7.5). A git variant of `inputs_from` would duplicate the resource model for no
+benefit — the shared branch already carries the work, which is simpler and more
+explicit.
 
 ```yaml
 tasks:
   - id: build
     resources:
-      - {type: git, with: {repo: REPO, ref: develop,
-                           branch: "hiveling/{run}/build", publish: push}}
+      - {type: git, with: {repo: REPO, ref: main,
+                           branch: "hiveling/{run}", publish: push}}
   - id: integrate
-    depends_on: [build]
+    depends_on: [build]        # same branch, resumed; no ref plumbing
     resources:
-      - {type: git, with: {repo: REPO, ref: "hiveling/{run}/build",
-                           branch: "hiveling/{run}/integrate", publish: push}}
+      - {type: git, with: {repo: REPO, ref: main,
+                           branch: "hiveling/{run}", publish: push}}
 ```
 
 `inputs_from` is kept **only for the non-git (zip/files) channel** — today's
@@ -907,7 +914,7 @@ defaults:
         path: "~/.cache/hiveling/app.git"
         worktree: true
         ref: main
-        branch: "hiveling/{run}/{task}"
+        branch: "hiveling/{run}"         # one branch per run, shared
         clean: full
         cache: [node_modules, .venv]
         publish: push
@@ -915,7 +922,7 @@ tasks:
   - id: feature
     prompt: "Implement the feature, run the tests, push the branch."
   - id: verify
-    prompt: "Check out the feature branch and run the test suite."
+    prompt: "Check out the feature and run the test suite."
     depends_on: [feature]
     resources:
       - type: git
@@ -923,8 +930,8 @@ tasks:
         with:
           repo: git@github.com:acme/app.git
           worktree: true
-          ref: "hiveling/{run}/feature"  # the branch produced by `feature`
-          branch: "hiveling/{run}/verify"
+          ref: main                     # only used if the branch is missing
+          branch: "hiveling/{run}"      # resumes `feature`'s tree
           publish: commit                # no push needed for a verification run
 ```
 
@@ -1002,10 +1009,13 @@ Compatibility guarantees:
    resolution is traced in the task events and `status.json`.
 7. **History growth / GC is deferred** and tracked in `todo.md`, not part of
    this design.
-8. **`branch_mode` / `force` defaults: `create` + no force.** A task creates its
-   branch from `ref` and cannot force-push unless it explicitly sets
-   `force: true`. This is the easy-to-reason-about default; updating an existing
-   branch is an explicit choice (`branch_mode: reuse` or `recreate`).
+8. **One branch per run; `branch_mode` / `force` defaults: `auto` + no force.**
+   Every task of a run shares `branch: "hiveling/{run}"`: the first creates it
+   from `ref`, the rest resume it, so a reviewer and a gate re-run reopen the
+   producer's tree. `finalize` merges the latest remote branch back in before
+   pushing, so parallel tasks on the shared branch do not clobber each other. A
+   task cannot force-push unless it explicitly sets `force: true`; starting a
+   line fresh from `ref` is the explicit choice (`branch_mode: recreate`).
 9. **OpenCode source materialization default: `auto`** (symlink/junction, copy
    fallback) with a per-kind preference: **skills are referenced by path in the
    generated `skills` array** (OpenCode supports it natively), while **agents
@@ -1051,9 +1061,9 @@ Compatibility guarantees:
 | `git` | `repo` | — | URL or local path. |
 | | `path` | required | Clone/worktree location; relative = location dir. |
 | | `worktree` | `false` | `true` = per-task worktree (parallel isolation). |
-| | `ref` | `HEAD` | **Start point** (branch/tag/sha). |
-| | `branch` | `hiveling/{run}/{task}` | **Target** branch to commit/push to. |
-| | `branch_mode` | `create` | `create\|reuse\|recreate`. |
+| | `ref` | `HEAD` | **Start point** (branch/tag/sha) when the branch is missing. |
+| | `branch` | `hiveling/{run}` | **Target** branch; one per run, shared by its tasks. |
+| | `branch_mode` | `auto` | `auto\|create\|reuse\|recreate`. |
 | | `push_to` | = `branch` | Remote ref to push (allows a different name). |
 | | `set_upstream` | `true` | Pass `-u` on push. |
 | | `force` | `false` | Allow a force push (logged/flagged). |

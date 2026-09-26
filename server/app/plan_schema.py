@@ -179,21 +179,41 @@ class TaskInput(BaseModel):
 
 
 class GateInput(BaseModel):
-    """A gate: a server-configured, read-only node that judges other tasks.
+    """A gate: a read-only review checkpoint that other tasks depend on.
 
-    The plan supplies the criteria (``prompt``) only: the agent, the
-    permissions and the machine-readable verdict contract are owned by the
-    server. When the gate does not answer ``VALID``, the analysed tasks are
-    reset and re-run, bounded by ``max_attempts``.
+    The plan supplies only the criteria (``prompt``); the gate agent, its
+    permissions and the ``VALID`` verdict contract are server-provided. If the
+    gate does not answer ``VALID``, the tasks it judges (``tasks``) and the gate
+    are reset and re-run, bounded by ``max_attempts``; exhaustion fails the run.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    id: str = Field(description="Unique gate id, used as a dependency by downstream tasks.")
-    tasks: list[str] = Field(description="Task ids this gate analyses and can reset.")
-    prompt: str = Field(description="The criteria the gate checks (the agent is server-provided).")
+    id: str = Field(
+        description=(
+            "Unique gate id. The NEXT phase depends on this id (put it in its "
+            "depends_on), not on the judged task's id."
+        )
+    )
+    tasks: list[str] = Field(
+        description=(
+            "Task ids the gate judges and can reset. Add the reviewer task too "
+            "when a rejection must re-run it; a task in this list may depend on "
+            "another task of the same gate."
+        )
+    )
+    prompt: str = Field(
+        description=(
+            "The criteria the gate checks. Do NOT set `agent`: the gate agent is "
+            "server-provided. On success it answers a standalone `VALID` line."
+        )
+    )
     max_attempts: int | None = Field(
-        default=None, description="Max gate evaluations before the run fails (default 20)."
+        default=None,
+        description=(
+            "Max gate evaluations before the run fails; each rejection consumes "
+            "one (default 20, so up to 19 rework rounds)."
+        ),
     )
     model: str | None = Field(default=None, description="Override the default model.")
     timeout_s: float | None = Field(default=None, description="Override the default timeout.")
@@ -215,7 +235,12 @@ class PlanInput(BaseModel):
     tasks: list[TaskInput] = Field(description="Tasks to run, in dependency order (required).")
     gates: list[GateInput] | None = Field(
         default=None,
-        description="Optional gates: read-only nodes that judge tasks and reset them when they answer without VALID.",
+        description=(
+            "Optional review checkpoints. A gate judges the tasks in its `tasks`; "
+            "the next phase depends on the gate id (not on the judged task). "
+            "Without a VALID verdict the judged tasks and the gate re-run, bounded "
+            "by max_attempts."
+        ),
     )
 
 
@@ -277,24 +302,49 @@ Top-level keys:
     `skills_paths`, `agents_md`, or the verbose `sources` list), so the plan
     carries paths instead of re-writing agent/skill bodies.
 
-- `gates` (optional list): read-only checkpoints over tasks. Each gate:
-  - `id` (required, unique): a node downstream tasks depend on.
-  - `tasks` (required, list of task ids): the tasks the gate analyses. A task
-    may belong to at most one gate, and a gate cannot analyse another gate.
-  - `prompt` (required): the criteria the gate checks. The gate agent,
-    permissions and verdict contract are provided by the server; do not set
-    `agent`.
-  - `max_attempts` (int, default 20): maximum number of gate evaluations before
-    the run fails. Each rejection consumes one, so at most `max_attempts - 1`
-    rework rounds are allowed.
+- `gates` (optional list): **review checkpoints that block and redo work**.
+  A gate is a node. Two rules are the whole idea:
+
+  1. a gate lists the tasks it judges in `tasks` (it runs after they succeed);
+  2. the **next** phase depends on the gate id, not on the judged task id.
+
+  ```yaml
+  tasks:
+    - {id: analyst,        agent: analyst,          prompt: "write docs/analysis.md"}
+    - {id: analyst-review, agent: analyst-reviewer, depends_on: [analyst],
+       prompt: "review docs/analysis.md -> docs/reviews/analysis-review.md"}
+    - {id: architect,      agent: architect,        depends_on: [analysis-gate],
+       prompt: "design from docs/analysis.md"}
+  gates:
+    - {id: analysis-gate, tasks: [analyst, analyst-review],
+       prompt: "Reject if the analysis misses a criterion, or the review flags a blocker."}
+  ```
+
+  A consumer of a gated task that does NOT depend on the gate is rejected.
+
+  Each gate:
+  - `id` (required, unique): the node downstream tasks depend on.
+  - `tasks` (required): the task ids the gate judges and can reset. Add the
+    reviewer task too when a rejection must re-run it (it may depend on the
+    producer of the same gate). A task belongs to at most one gate; a gate cannot
+    judge another gate.
+  - `prompt` (required): the criteria. Do NOT set `agent`: the server owns the
+    gate agent (`hiveling-gate`, read-only) and the verdict contract.
+  - `max_attempts` (optional, default 20): gate evaluations before the run fails.
   - `model`, `timeout_s`, `variant`, `title` (optional).
-  A gate runs on a worker with no repository and reads the decision material the
-  server uploads under `./_hiveling/` (the plan, each analysed task's status,
-  result and downloaded files). It answers with a standalone `VALID` line, or
-  with the corrections it requires. Without `VALID`, the analysed tasks and the
-  gate are reset and re-run, bounded by `max_attempts`; exhaustion fails the run.
-  Every consumer of a gated task must depend on the gate, not on the task
-  directly (a plan that violates this is rejected).
+
+  Behaviour: the gate runs on a worker with no repository and reads the decision
+  material the server uploads under `./_hiveling/` (the plan, each judged task's
+  status, result and downloaded files) — give judged tasks `download:
+  modified`/`all` so it sees their files. It ends with a standalone `VALID` line,
+  or with the corrections needed. Without `VALID`, the judged tasks and the gate
+  are reset and re-run with those corrections injected, up to `max_attempts`.
+  Because every task shares one branch and the provider resumes an existing
+  branch, a re-run reopens the rejected tree (the producer sees its artifact and
+  the reviewer's report). After `max_attempts` negative evaluations the gate
+  fails and the run stops (fail-fast). `get_task` exposes
+  `kind: "gate"`, `gate_targets`, `gate_attempt`, `gate_verdict` and
+  `gate_feedback`.
 
 Built-in providers:
 
@@ -305,9 +355,14 @@ Built-in providers:
   The plan never carries the value.
 - `git` — `{repo, path, worktree?, ref?, branch?, branch_mode?, merge?,
   push_to?, set_upstream?, force?, clean?, cache?, publish?, remote?}`. `ref` is
-  the start point, `branch` the target the task commits to; `publish` is
-  `none|commit|push`. `merge` is a list of refs merged into `branch` during
-  prepare; a conflict is resolved by the worker itself (Opencode), not failed.
+  the start point, `branch` the target the task commits to. `branch_mode` (default
+  `auto`) **resumes** `branch` when it already exists on the remote and only falls
+  back to `ref` when it does not (`recreate` always starts from `ref`, `reuse`
+  requires the branch). Give every task of a run the same `branch:
+  "hiveling/{run}"`: the first creates it, the rest — and every gate re-run —
+  reopen it and see each other's files. `publish` is `none|commit|push`. `merge`
+  is a list of refs merged into `branch` during prepare; a conflict is resolved by
+  the worker itself (Opencode), not failed.
 - `path` — expose an existing folder: `{path, mode: ro|rw, visible?}`.
 
 Git layout (matters for prompts):
@@ -341,8 +396,9 @@ Resource notes:
   is staged outside the workspace — see the Git layout notes above).
 - `{run}` and `{task}` in resource option strings are resolved by the server
   (task-local only). Cross-task references do not exist: to consume another
-  task's branch, declare the repo with `ref: "hiveling/{run}/<producer>"` and
-  list it in `depends_on`.
+  task's work, share its `branch` (`"hiveling/{run}"`) and list it in
+  `depends_on` — the provider resumes the branch. Use an explicit
+  `ref: "hiveling/{run}/<line>"` only for a genuinely separate branch line.
 
 Notes:
 
@@ -370,29 +426,42 @@ defaults:
   timeout_s: 600
 
 tasks:
-  - id: hello
-    prompt: "Reply with exactly: PONG"
-    download: none
-
+  # A plain task with no gate.
   - id: on-windows
     prompt: "Reply with the result of: echo %OS%"
-    requirements:
-      os: windows
+    requirements: {os: windows}
     download: none
 
-  - id: write-report
-    prompt: >
-      Create a file named report.txt with three lines: one, two, three.
-    depends_on: [hello]
+  # Phase 1: a producer and its reviewer (the reviewer writes a report).
+  # Every task shares ONE branch (`hiveling/{run}`): the first creates it from
+  # `ref`, the others resume it, so the reviewer sees the producer's file and a
+  # gate re-run reopens the whole tree.
+  - id: analyst
+    agent: analyst
+    prompt: "Read feature.md and write docs/analysis.md."
+    resources: [{type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
+                 ref: main, branch: "hiveling/{run}", publish: push}}]
+  - id: analysis-review
+    agent: analyst-reviewer
+    depends_on: [analyst]
+    prompt: "Review docs/analysis.md; write docs/reviews/analysis-review.md."
+    resources: [{type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
+                 ref: main, branch: "hiveling/{run}", publish: push}}]
 
-  - id: summarize
-    prompt: "Read report.txt and summarize it in a single sentence."
-    depends_on: [report-gate]
-    inputs_from: [write-report]
+  # Phase 2 starts only once phase 1 is VALID: it depends on the GATE, not analyst.
+  - id: architect
+    agent: architect
+    depends_on: [analysis-gate]
+    prompt: "Design from docs/analysis.md; write docs/design.md."
+    resources: [{type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
+                 ref: main, branch: "hiveling/{run}", publish: push}}]
 
 gates:
-  - id: report-gate
-    tasks: [write-report]
-    prompt: "report.txt exists and contains exactly the lines one, two, three."
+  # A rejection re-runs analyst AND analysis-review, bounded by max_attempts.
+  - id: analysis-gate
+    tasks: [analyst, analysis-review]
+    prompt: >
+      Reject if docs/analysis.md misses an acceptance criterion or a work item,
+      or if docs/reviews/analysis-review.md reports a blocker.
     max_attempts: 5
 """

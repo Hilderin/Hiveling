@@ -17,8 +17,14 @@ Prefer `create_plan` (typed object) for new plans; `update_plan` /
 
 ## Golden rules
 
-- **Workers are not in the plan.** They live in `workers.yaml`; select one with
-  `requirements`. Never invent a worker, path or capability.
+- **Workers are not in the plan.** They are configured server-side and surfaced
+  by `list_workers()`; select one with `requirements`. Never invent a worker,
+  path or capability.
+- **Never touch the server's filesystem.** Plans, runs, task history and worker
+  config live on the server host, not on your disk. Get them from the tools
+  (see *Where state lives*); do not glob or grep for `workers.yaml`, `.data/`,
+  `run.json`, `status.json`, `events.jsonl` or a job history — searching for
+  them finds nothing and is the wrong move.
 - **The plan is explicit and self-contained.** No include, no named environment,
   **no cross-task substitution**. Everything is written out.
 - **`depends_on` is always explicit.** Ordering is never inferred. `inputs_from`
@@ -31,6 +37,26 @@ Prefer `create_plan` (typed object) for new plans; `update_plan` /
   review task that returns `CHANGES_REQUESTED` is still `succeeded`, and its
   consumers start anyway. Declare a `gates` entry to make a negative verdict
   stop and re-run the work. See *Gates*.
+
+## Where state lives (MCP tools only, never the filesystem)
+
+The orchestrating model runs **outside** the Hiveling server. Plans, runs, task
+history and the worker list live on the server host and are **not** on your
+disk; there is no tool to read an arbitrary server file, and the tools redact
+server paths on purpose. Reach state only through the MCP tools — never the
+filesystem, and never a raw HTTP/JSON call:
+
+| You need… | Call |
+| --- | --- |
+| Workers, reachable/busy, and capabilities (`os`, `tags`, `labels`, `providers`, `path_roots`) | `list_workers()` |
+| Stored plans; one plan's YAML | `list_plans()`, `get_plan(name)` |
+| A run's status and every task | `get_run(run_id)` |
+| One task: result text, error, changed files, commits, merge, artifacts, event tail | `get_task(run_id, task_id)` |
+| The plan a run executes | `get_run_plan(run_id)` |
+
+If you are about to look for `workers.yaml`, a `.data/` directory, `run.json`,
+`status.json`, `events.jsonl` or a job history, stop: the answer you want is in
+`list_workers()` / `get_run()` / `get_task()`.
 
 ## Authoring (tools: get_plan_schema, list_workers, create_plan, get_plan)
 
@@ -112,7 +138,9 @@ profile (all actions denied except `read`/`glob`/`grep`; `*.env` denied). The
 plan supplies only the criteria (the gate `prompt`).
 
 **The gate has no repository.** It runs on a worker in a fresh workspace and
-reads the decision material the server uploads under `./_hiveling/`:
+reads the decision material the server uploads under `./_hiveling/`. Those
+paths exist in the **gate's** workspace only; as the orchestrator you never look
+for them on disk — inspect a gate with `get_task(run_id, gate_id)`:
 
 ```
 _hiveling/gate.json      criteria, attempt, previous verdicts
@@ -131,15 +159,15 @@ Hiveling appends this instruction itself; the plan only writes the criteria.
 
 **The retry loop.** On a rejection **every task in `tasks`** and the gate go back
 to `pending`; the gate's answer is injected into each retried task's prompt (and
-`_hiveling/gate-feedback.json`), and — because the retry starts from the same
-`ref` — their `git` resources are **force-pushed** so the branch is replaced (no
-consumer has read it: consumers depend on the gate). The injected block is
-role-neutral: *a producer fixes its artifact; a reviewer re-inspects the updated
-artifact and rewrites its report* (producers and reviewers are re-run in
-dependency order, so a reviewer that consumes the producer's branch sees the
-updated tree). A negative evaluation bumps `gate_attempt` (shown in the dashboard
-as `attempt N/M`); after `max_attempts` negative evaluations the gate is marked
-`failed`.
+`_hiveling/gate-feedback.json`). Because every task shares one branch and the
+provider resumes a branch that already exists (`branch_mode: auto`), each retried
+task reopens the tree as the previous attempt left it — the producer sees its own
+artifact *and* the reviewer's report, fixes it, then the reviewer re-inspects the
+updated tree. The injected block is role-neutral: *a producer fixes its artifact;
+a reviewer re-inspects the updated artifact and rewrites its report* (producers
+and reviewers are re-run in dependency order). A negative evaluation bumps
+`gate_attempt` (shown in the dashboard as `attempt N/M`); after `max_attempts`
+negative evaluations the gate is marked `failed`.
 
 **One unit, one gate.** List in `tasks` everything that must be re-run on a
 rejection — the producer **and** the reviewer that judges it. A reviewer target
@@ -155,7 +183,7 @@ consumes a target must still depend on the gate.
    reviewer that consumes the producer target; both reset together). This is
    what prevents a consumer from running on an un-approved artifact.
 
-**Observable:** the gate is a task in `run.json`/`get_task` with
+**Observable:** the gate is a task in `get_run`/`get_task` with
 `kind: "gate"`, `gate_targets`, `gate_attempt` (negative evaluations so far;
 `attempt N/M` in the UI), `gate_max_attempts`, `gate_verdict` and
 `gate_feedback`; the dashboard shows it distinctly and opens it on its own page.
@@ -174,7 +202,7 @@ tasks:
     prompt: "Produce ./src/repo/docs/ui-design.md."
     resources:
       - {type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
-          ref: main, branch: "hiveling/{run}/{task}", publish: push}}
+          ref: main, branch: "hiveling/{run}", publish: push}}
 
   - id: coder                              # starts only once the design is VALID
     agent: coder
@@ -182,7 +210,7 @@ tasks:
     prompt: "Implement ./src/repo/docs/ui-design.md."
     resources:
       - {type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
-          ref: "hiveling/{run}/designer", publish: push}}
+          ref: main, branch: "hiveling/{run}", publish: push}}
 
 gates:
   - id: designer-gate
@@ -198,6 +226,30 @@ There is no separate `designer-fix` task: a rejection re-runs `designer` with
 the gate's corrections injected. If you prefer a distinct fixer agent, use
 `update_run_plan` to add one after a rejection and `resume_run`, or split the
 work into two gated phases.
+
+If the phase also has a **reviewer that writes a report**, list it in the gate's
+`tasks` too, or a rejection re-runs only the producer and the review stays stale.
+A task that is a target of the gate may depend on another target of the same
+gate:
+
+```yaml
+  - id: designer-review
+    agent: designer-reviewer
+    depends_on: [designer]
+    prompt: "Review docs/ui-design.md; write docs/reviews/ui-design-review.md."
+    resources:
+      - {type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
+          ref: main, branch: "hiveling/{run}", publish: push}}   # SAME branch
+
+gates:
+  - id: designer-gate
+    tasks: [designer, designer-review]    # a rejection re-runs BOTH, in order
+    prompt: "Reject if docs/ui-design.md is wrong or the review reports a blocker."
+```
+
+Sharing the branch is what makes the loop work: the reviewer sees the
+producer's file, and on a rejection the producer reopens its own document **and**
+the reviewer's report (no `ref` pointing at the producer, no per-task branch).
 
 ## Running and supervising (the agentic loop)
 
@@ -238,16 +290,22 @@ Decision rules:
 ## Recipes for an agentic dev loop
 
 - **One concern per task.** Small, bounded prompts; let the DAG express the plan.
-- **Branch per task, deterministic:** `branch: "hiveling/{run}/{task}"` +
-  `publish: push`. `{run}` and `{task}` are the only substitutions (task-local).
-  With `worktree: true` the prompt must point at `./src/repo`; with
-  `worktree: false` it is `./repo`.
-- **`publish: push` is a contract.** The task must produce a change; if it edits
-  nothing (and merges nothing in prepare) the task **fails**. A read-only task
-  that consumes a branch (e.g. a verify task) must use `publish: none` (or
-  `commit`). A **writer reviewer** that writes `docs/reviews/<phase>-review.md`
-  does modify the tree, so it uses `publish: push`/`commit` — and needs the
-  `edit` carve-out for that path, or the write is denied.
+- **One branch per run, shared.** Use `branch: "hiveling/{run}"` on **every**
+  task + `publish: push`. The first task creates it from `ref` (e.g. `main`);
+  the others, and every gate re-run, **resume** it (`branch_mode: auto`), so they
+  see each other's files and commits. `{run}` and `{task}` are the only
+  substitutions (task-local). A task that needs an isolated line (genuinely
+  parallel, independent work) sets its own explicit `branch`. With
+  `worktree: true` the prompt must point at `./src/repo`; with `worktree: false`
+  it is `./repo`.
+- **`publish: push` is a contract.** On a **fresh** branch the task must produce
+  a change: if it edits nothing (and merges nothing in prepare) it **fails**
+  (that is the wrong-tree guard). A **resumed** branch that changes nothing is a
+  legitimate no-op. A read-only task that consumes a branch (e.g. a verify task)
+  should use `publish: none` (or `commit`). A **writer reviewer** that writes
+  `docs/reviews/<phase>-review.md` does modify the tree, so it uses
+  `publish: push`/`commit` — and needs the `edit` carve-out for that path, or the
+  write is denied.
 - **Do not ask the agent to commit.** The `git` provider runs `git add -A` +
   `git commit` + push at finalize (Python, no shell), so a prompt that says
   "commit on the current branch" only invites the agent to fight shell quoting
@@ -260,21 +318,25 @@ Decision rules:
 - **Permissions come from the injected config, not a flag.** There is no `auto`
   option and the worker never passes `--auto`. A task may only do what the
   effective `opencode.json` and its agent `permissions` allow.
-- **Consume a producer's branch** by naming it + explicit ordering:
+- **Consume upstream work by ordering, not by branch plumbing.** With the shared
+  branch, `depends_on` (or the gate id) is enough — the consumer resumes the
+  branch and already has the producer's files:
 
   ```yaml
   - id: test
-    depends_on: [build]
+    depends_on: [build]          # build committed to hiveling/{run}
     resources:
       - {type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
-          ref: "hiveling/{run}/build", branch: "hiveling/{run}/test", publish: push}}
+          ref: main, branch: "hiveling/{run}", publish: push}}
   ```
 
+  A `ref: "hiveling/{run}/<other>"` is only for a **separate** line you do not
+  share (e.g. an integration task that must combine another feature branch).
 - **Integrate several branches** with `merge: [refs]`: it merges into `branch`
   during prepare and resolves conflicts with a nested OpenCode run. Each merged
-  ref must already be pushed, so list its producer in `depends_on`; the base
-  branch should be one the others already share. Read
-  `status.json.merge` / `events.jsonl` (`hiveling.merge`) for the result.
+  ref must already be pushed, so list its producer in `depends_on`. Read the
+  merge outcome from `get_task(...).merge` (and the event tail) — see *Where
+  state lives*.
 - **Keep reports** with `artifacts: {paths: ["reports/**"], git: true}`.
 - **Pick the environment** with `requirements` (e.g. `os: windows`); a follow-up
   can run on a different OS as long as it consumes a pushed branch.
@@ -365,6 +427,8 @@ finding if omitted:
   prompts concise; use `prompt_file`.
 - Forgetting `depends_on` on a consumer of a produced branch or a gate.
 - Calling `update_run_plan` with invalid YAML: it is validated and rejected.
+- Searching the filesystem for `workers.yaml`, `.data/` or a run's job dir: that
+  state is server-side only. Use `list_workers()`, `get_run()` and `get_task()`.
 
 ## Checklist
 

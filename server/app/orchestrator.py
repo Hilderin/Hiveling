@@ -931,7 +931,7 @@ class Orchestrator:
         else:
             feedback = self._gate_feedback.get(task.id)
             prompt = with_gate_feedback(task.prompt, feedback) if feedback else task.prompt
-            resources = self._retry_resources(task.resources) if feedback else task.resources
+            resources = task.resources
             agent = task.agent
             opencode = task.opencode
             artifacts = task.artifacts
@@ -1180,23 +1180,6 @@ class Orchestrator:
             if task.id == task_id:
                 return task
         return None
-
-    @staticmethod
-    def _retry_resources(resources: list[dict]) -> list[dict]:
-        """Force-push on a retry: the branch already exists on the remote.
-
-        Safe because the consumer depends on the gate, so no downstream task has
-        read the rejected attempt's branch.
-        """
-        retried: list[dict] = []
-        for resource in resources or []:
-            if resource.get("type") == "git":
-                resource = dict(resource)
-                options = dict(resource.get("with") or {})
-                options["force"] = True
-                resource["with"] = options
-            retried.append(resource)
-        return retried
 
     def _feedback_inputs(self, task: Task) -> list[tuple[str, Path]]:
         """The gate rejection, uploaded for a retried task to read."""

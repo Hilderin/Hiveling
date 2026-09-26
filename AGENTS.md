@@ -170,6 +170,7 @@ reaches the box as `ssh hiveling-win` (user `si_z_`, key `~/.ssh/hiveling_win`).
 | `git: nothing to push for branch 'x' … the task made no change` | the task edited the wrong tree (see §6) or is read-only: use `publish: none`/`commit`. |
 | Task `succeeded` but consumer fails `merge ref not found` / `ref not found` | the producer pushed nothing (see previous line), or the consumer's ref is misspelled / lacks `depends_on`. |
 | `opencode` finds no files / edits the wrong place | the prompt points at the workspace root instead of the checkout (`./src/<id>`); the worker prepends a `[Working environment]` block — read it in `events.jsonl`. |
+| A re-run after a gate rejection says its previous artifact is missing | the task's branch did not exist when it was prepared, so it started from `ref`. Tasks of a run must share one branch (`branch: "hiveling/{run}"`, `branch_mode: auto` resumes it); a per-task branch is never resumed. |
 | `worker unreachable` after N tries | worker restarted or network; the job is lost (a worker restart fails its in-flight job). |
 | `/api/workers` says `reachable: false` but the worker's `/health` answers locally | Windows: inbound 8787-8789 blocked by the firewall, or the worker was started over SSH and died on disconnect — see §3 *Windows workers over SSH*. |
 | Task `failed` with `timeout after Ns` | raise `timeout_s`; check the opencode process was terminated (logs) — long prompts on Windows hit CLI length limits. |
@@ -186,18 +187,25 @@ reaches the box as `ssh hiveling-win` (user `si_z_`, key `~/.ssh/hiveling_win`).
   checkout — a clone at `<workspace>/<path>` used to swallow edits silently).
   `worktree: false` → checkout in place at `path`.
 - **`ref` vs `branch`.** `ref` = start point (branch/tag/sha), `branch` =
-  target the task commits to. A consumer names the producer's branch as `ref`
-  **and** lists it in `depends_on`.
-- **Remote-only refs.** A consumed branch exists only as `origin/<ref>` in a
-  fresh clone; the provider resolves local→`origin/`→fetch→error
+  target the task commits to. A run's tasks **share one branch**
+  (`branch: "hiveling/{run}"`): the first creates it from `ref`, the rest resume
+  it, so a consumer just lists its producer in `depends_on` (no `ref` plumbing).
+- **`branch_mode` / resume.** Default `auto`: an existing `branch` (local or
+  `origin/<branch>`) is resumed and the task's commits stack on top; `ref` is
+  used only when the branch is missing. `create` fails if it exists, `reuse`
+  requires it, `recreate` starts from `ref` again (needs `force` to overwrite).
+- **Remote-only refs.** In a fresh clone a branch exists only as
+  `origin/<branch>`; the provider resolves local→`origin/`→fetch→error
   (`git: ref not found: '…'`). A hard failure here means the producer did not
   push (check `status.json.commits[*].pushed` and the remote).
 - **`merge: [refs]`** merges during prepare and resolves conflicts with a
   nested OpenCode run (`CONFLICT_PROMPT`); the result is in `status.json.merge`
   and `events.jsonl` (`hiveling.merge` conflict/resolved). Unresolved → prepare
-  fails with the file list.
-- **Never force-push** unless `force: true`. `branch_mode` defaults to
-  `create` (fails if the branch exists → use `reuse`/`recreate`).
+  fails with the file list. `finalize` also merges the latest `origin/<branch>`
+  before pushing, so **parallel tasks on the shared branch** do not clobber each
+  other.
+- **Never force-push** unless `force: true` (a shared branch plus `force` can
+  discard a parallel task's commit).
 
 ## 7. Worker internals worth knowing
 

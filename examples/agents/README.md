@@ -41,14 +41,14 @@ tasks:
     agent: architect
     prompt: "Produce docs/design.md and commit on the current branch."
     resources: [{type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
-                 ref: main, branch: "hiveling/{run}/{task}", publish: push}}]
+                 ref: main, branch: "hiveling/{run}", publish: push}}]
 
   - id: design-review
     agent: architect-reviewer
     depends_on: [design]
     prompt: "Review docs/design.md; write docs/reviews/design-review.md and commit it."
     resources: [{type: git, id: repo, with: {repo: REPO, path: repo, worktree: true,
-                 ref: "hiveling/{run}/design", branch: "hiveling/{run}/{task}", publish: push}}]
+                 ref: main, branch: "hiveling/{run}", publish: push}}]  # SAME branch
 
   - id: implement
     agent: coder

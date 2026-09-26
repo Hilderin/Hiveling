@@ -3,14 +3,18 @@
 Two layouts share the same options:
 
 - **worktree** (``worktree: true``): a durable clone at ``path`` and a per-task
-  worktree under the job location, on its own ``branch``. Parallel tasks on the
-  same repo never collide and canonical checkouts are untouched.
+  worktree under the job location, on ``branch``.
 - **canonical** (``worktree: false``, the default): the clone at ``path`` is
   checked out in place (legacy multi-repo layouts, absolute paths).
 
-``ref`` is the start point; ``branch`` is the target the task commits to.
-Dependencies between tasks are always explicit in the plan (``depends_on``);
-branch names are written out, so no cross-task magic is needed.
+``ref`` is the start point; ``branch`` is the target the task commits to. A
+feature's tasks share one ``branch``: with the default ``branch_mode: auto`` the
+provider **resumes** ``branch`` when it already exists on the remote and only
+falls back to ``ref`` when it does not, so a producer, its reviewer and a gate
+re-run all reopen the same tree and see each other's commits. When several tasks
+share a branch and run in parallel, ``finalize`` merges the latest remote branch
+back in (conflicts resolved by OpenCode) before pushing, so their pushes do not
+clobber each other.
 """
 
 from __future__ import annotations
@@ -53,7 +57,7 @@ _ALLOWED = {
     "commit_message",
     "merge",
 }
-_BRANCH_MODES = {"create", "reuse", "recreate"}
+_BRANCH_MODES = {"auto", "create", "reuse", "recreate"}
 _CLEAN_MODES = {"none", "git", "full"}
 _PUBLISH_MODES = {"none", "commit", "push"}
 _CONFIG_NAMES = ("opencode.json", "opencode.jsonc")
@@ -111,7 +115,7 @@ class GitProvider:
             raise EnvironmentError("git: 'repo' is required")
         if not resource.options.get("path"):
             raise EnvironmentError("git: 'path' is required")
-        branch_mode = resource.options.get("branch_mode", "create")
+        branch_mode = resource.options.get("branch_mode", "auto")
         if branch_mode not in _BRANCH_MODES:
             raise EnvironmentError(
                 f"git: 'branch_mode' must be one of {sorted(_BRANCH_MODES)}"
@@ -143,8 +147,11 @@ class GitProvider:
         configured = resource.options.get("branch")
         if configured:
             return str(configured)
+        # Default to one branch per run: every task of a run shares it, so
+        # consumers and gate re-runs see the producer's commits (see the module
+        # docstring). A task that needs its own line sets `branch` explicitly.
         run = ctx.run_id or "run"
-        return f"hiveling/{run}/{ctx.task_id or 'task'}"
+        return f"hiveling/{run}"
 
     @staticmethod
     def _clean(repo: Path, mode: str, cache: list[str]) -> None:
@@ -201,7 +208,7 @@ class GitProvider:
             check_path_allowed(repo_path, ctx, label="git")
         ref = str(options.get("ref") or "HEAD")
         branch = self._branch(resource, ctx)
-        branch_mode = str(options.get("branch_mode", "create"))
+        branch_mode = str(options.get("branch_mode", "auto"))
         clean = str(options.get("clean", "git"))
         cache = [str(c) for c in (options.get("cache") or [])]
 
@@ -218,9 +225,9 @@ class GitProvider:
         self._ensure_clone(repo_path, str(options["repo"]))
 
         if worktree:
-            self._add_worktree(repo_path, workdir, branch, ref, branch_mode)
+            resumed = self._add_worktree(repo_path, workdir, branch, ref, branch_mode)
         else:
-            self._checkout(repo_path, branch, ref, branch_mode, clean, cache)
+            resumed = self._checkout(repo_path, branch, ref, branch_mode, clean, cache)
 
         # Merge the requested refs into the branch. A conflict is resolved by a
         # nested OpenCode run (see CONFLICT_PROMPT), not by failing the prepare.
@@ -244,6 +251,7 @@ class GitProvider:
                 "clone": str(repo_path),
                 "branch": branch,
                 "worktree": worktree,
+                "resumed": resumed,
                 "config_root": str(config_root) if config_root else None,
                 "under_location": under_location,
                 "start_sha": start_sha,
@@ -385,6 +393,42 @@ class GitProvider:
         root = root.resolve()
         return path == root or root in path.parents
 
+    @staticmethod
+    def _local_branch(repo: Path, branch: str) -> bool:
+        return (
+            _run(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], repo)
+            .returncode
+            == 0
+        )
+
+    @staticmethod
+    def _remote_branch(repo: Path, branch: str) -> str | None:
+        ref = f"refs/remotes/origin/{branch}"
+        if _run(["rev-parse", "--verify", "--quiet", ref], repo).returncode == 0:
+            return ref
+        return None
+
+    def _resolve_branch(
+        self, repo: Path, branch: str, branch_mode: str
+    ) -> tuple[bool, bool, str | None]:
+        """Decide how to obtain ``branch``.
+
+        Returns ``(resumed, local, remote)``: ``resumed`` means the branch
+        already exists and its commits must be kept; ``local``/``remote`` say
+        where it exists. Enforces the ``create``/``reuse`` modes (``recreate``
+        is handled by the caller with ``-B``).
+        """
+        local = self._local_branch(repo, branch)
+        remote = None if local else self._remote_branch(repo, branch)
+        if branch_mode == "create" and (local or remote):
+            raise EnvironmentError(f"git: branch '{branch}' already exists")
+        if branch_mode == "reuse" and not (local or remote):
+            raise EnvironmentError(
+                f"git: branch '{branch}' does not exist (branch_mode: reuse)"
+            )
+        resumed = branch_mode in ("auto", "reuse") and bool(local or remote)
+        return resumed, local, remote
+
     def _checkout(
         self,
         repo: Path,
@@ -393,48 +437,54 @@ class GitProvider:
         branch_mode: str,
         clean: str,
         cache: list[str],
-    ) -> None:
-        # Prefer the remote-tracking ref for fetch results.
-        start = self._resolve_ref(repo, ref, label="ref")
-        self._clean(repo, clean, cache)
-        exists = _run(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], repo)
-        if branch_mode == "recreate" and exists.returncode == 0:
-            _git(["branch", "-D", branch], repo, check=False)
-            exists = _run(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], repo)
-        if branch_mode == "create" and exists.returncode == 0:
-            raise EnvironmentError(f"git: branch '{branch}' already exists")
-        if exists.returncode == 0:
+    ) -> bool:
+        """Check out ``branch`` in place; return True when it was resumed."""
+        resumed, local, remote = self._resolve_branch(repo, branch, branch_mode)
+        if branch_mode == "recreate":
+            start = self._resolve_ref(repo, ref, label="ref")
+            result = _git(["checkout", "-B", branch, start], repo)
+        elif resumed and local:
             result = _git(["checkout", branch], repo)
+            if result.returncode == 0 and remote:
+                # A durable clone can be behind the remote branch (another task
+                # pushed): fast-forward to the latest, never rebase.
+                _git(["merge", "--ff-only", remote], repo, check=False)
+        elif resumed:
+            result = _git(["checkout", "-b", branch, remote], repo)
         else:
+            start = self._resolve_ref(repo, ref, label="ref")
             result = _git(["checkout", "-b", branch, start], repo)
         if result.returncode != 0:
             raise EnvironmentError(
                 f"git: could not check out '{branch}': {result.stderr.strip()[-500:]}"
             )
+        self._clean(repo, clean, cache)
+        return resumed
 
     def _add_worktree(
         self, clone: Path, workdir: Path, branch: str, ref: str, branch_mode: str
-    ) -> None:
+    ) -> bool:
+        """Create ``branch``'s worktree; return True when it was resumed."""
         _git(["worktree", "prune"], clone, check=False)
         if workdir.exists():
             shutil.rmtree(workdir, ignore_errors=True)
             _git(["worktree", "prune"], clone, check=False)
-        exists = _run(
-            ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], clone
-        )
-        if branch_mode == "recreate" and exists.returncode == 0:
-            _git(["branch", "-D", branch], clone, check=False)
-            exists = _run(
-                ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], clone
-            )
-        if branch_mode == "create" and exists.returncode == 0:
-            raise EnvironmentError(f"git: branch '{branch}' already exists")
+        resumed, local, remote = self._resolve_branch(clone, branch, branch_mode)
         workdir.parent.mkdir(parents=True, exist_ok=True)
-        if exists.returncode == 0:
+        if branch_mode == "recreate":
+            start = self._resolve_ref(clone, ref, label="ref")
+            result = _git(
+                ["worktree", "add", "-B", branch, str(workdir), start], clone
+            )
+        elif resumed and local:
             result = _git(["worktree", "add", str(workdir), branch], clone)
+        elif resumed:
+            result = _git(
+                ["worktree", "add", "-b", branch, str(workdir), remote], clone
+            )
         else:
-            # The plan names the branch as it exists on the remote; resolve it
-            # (local ref or origin/<ref>) before handing it to `worktree add`.
+            # The branch does not exist yet: create it from the start point
+            # (a local ref or `origin/<ref>`), which `_resolve_ref` resolves.
             start = self._resolve_ref(clone, ref, label="ref")
             result = _git(
                 ["worktree", "add", "-b", branch, str(workdir), start], clone
@@ -444,6 +494,7 @@ class GitProvider:
                 f"git: could not create worktree for '{branch}': "
                 f"{result.stderr.strip()[-500:]}"
             )
+        return resumed
 
     # ---------------------------------------------------------------- finalize
     def finalize(
@@ -487,19 +538,23 @@ class GitProvider:
         head = _run(["rev-parse", "HEAD"], repo).stdout.strip()
         moved = bool(start_sha and head and head != start_sha)
         resolved = bool((prepared.state.get("merge") or {}).get("commits"))
+        resumed = bool(prepared.state.get("resumed"))
 
         # A task that asked to push must have something to push. Publishing an
         # empty branch means the tree the provider commits was not the one the
         # agent edited (the classic `<workspace>/<path>` vs `<workspace>/src/<id>`
         # mix-up), so fail instead of silently "succeeding" with nothing on the
-        # remote. A branch advanced by a prepare-time `merge` is a real change;
-        # review/verification tasks that consume a branch and touch nothing
-        # should use `publish: none` (or `commit`).
+        # remote. A branch advanced by a prepare-time `merge` is a real change,
+        # and a resumed branch that produced no change is a legitimate no-op
+        # (the task agrees with the tree its reviewer left): only a fresh branch
+        # that produced nothing is an error. Review tasks that consume a branch
+        # and touch nothing should use `publish: none` (or `commit`).
         if (
             publish == "push"
             and not committed
             and not moved
             and not resolved
+            and not resumed
         ):
             raise EnvironmentError(
                 f"git: nothing to push for branch '{branch}' ({repo}); the task "
@@ -508,11 +563,16 @@ class GitProvider:
                 f"use publish: none?"
             )
 
-        if publish == "commit" or (not committed and not moved):
+        if publish == "commit" or (not committed and not moved and not resumed):
             # Nothing to push, or push not requested.
             return FinalizeResult(
                 commits=[self._commit_entry(repo, branch, head, remote, False, options)]
             )
+
+        if not force:
+            # Tasks of a feature share one branch. If a parallel task advanced it
+            # meanwhile, merge that work back so the push is fast-forward.
+            self._reconcile_remote(repo, push_to, remote, ctx)
 
         push_args = ["push"]
         if set_upstream:
@@ -521,6 +581,11 @@ class GitProvider:
             push_args.append("--force")
         push_args += [remote, f"{branch}:{push_to}"]
         pushed = _git(push_args, repo)
+        if pushed.returncode != 0 and not force:
+            # Lost a race with another task on the shared branch: reconcile
+            # again and retry once.
+            self._reconcile_remote(repo, push_to, remote, ctx)
+            pushed = _git(push_args, repo)
         if pushed.returncode != 0:
             raise EnvironmentError(
                 f"git: push failed: {pushed.stderr.strip()[-500:]}"
@@ -529,6 +594,75 @@ class GitProvider:
         return FinalizeResult(
             commits=[self._commit_entry(repo, branch, sha, remote, True, options)]
         )
+
+    def _reconcile_remote(
+        self, repo: Path, branch: str, remote: str, ctx: Context
+    ) -> None:
+        """Merge the latest remote ``branch`` into the local one before a push.
+
+        Tasks of a feature share one branch: each resumes it at prepare and
+        commits. A parallel task may push meanwhile, so merge its work back
+        (conflicts are resolved by OpenCode, as for a prepare-time ``merge``) and
+        keep the push fast-forward.
+        """
+        fetch = _git(
+            ["fetch", remote, "--prune", "--tags", "--force"], repo, check=False
+        )
+        if fetch.returncode != 0:
+            return  # offline: let the push surface the real error
+        tracking = f"refs/remotes/{remote}/{branch}"
+        if _run(["rev-parse", "--verify", "--quiet", tracking], repo).returncode != 0:
+            return
+        if _run(["merge-base", "--is-ancestor", tracking, "HEAD"], repo).returncode == 0:
+            return
+        if _git(["merge", "--ff-only", tracking], repo, check=False).returncode == 0:
+            return
+        result = _git(["merge", "--no-ff", "--no-edit", tracking], repo, check=False)
+        unmerged, markers = self._conflicts(repo)
+        if unmerged or markers:
+            emit_event(
+                ctx,
+                {
+                    "type": "hiveling.merge",
+                    "phase": "conflict",
+                    "ref": tracking,
+                    "files": unmerged or markers,
+                },
+            )
+            self._resolve_conflicts(repo, ctx)
+            unmerged, markers = self._conflicts(repo)
+            if unmerged or markers:
+                emit_event(
+                    ctx,
+                    {
+                        "type": "hiveling.merge",
+                        "phase": "unresolved",
+                        "ref": tracking,
+                        "files": unmerged or markers,
+                    },
+                )
+                raise EnvironmentError(
+                    f"git: merge conflicts on '{remote}/{branch}' could not be "
+                    f"resolved: {', '.join((unmerged or markers)[:20])}"
+                )
+            emit_event(
+                ctx, {"type": "hiveling.merge", "phase": "resolved", "ref": tracking}
+            )
+        elif result.returncode != 0:
+            raise EnvironmentError(
+                f"git: could not merge '{remote}/{branch}' before push: "
+                f"{result.stderr.strip()[-500:]}"
+            )
+        if self._merge_in_progress(repo):
+            commit = _git(
+                ["commit", "--no-edit", "-m", f"hiveling: merge {remote}/{branch}"],
+                repo,
+            )
+            if commit.returncode != 0:
+                raise EnvironmentError(
+                    f"git: merge commit for '{remote}/{branch}' failed: "
+                    f"{commit.stderr.strip()[-500:]}"
+                )
 
     @staticmethod
     def _commit_entry(
