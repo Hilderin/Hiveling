@@ -21,6 +21,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
+from fastapi.staticfiles import StaticFiles
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel
 
@@ -40,6 +41,9 @@ from .runs import TERMINAL_RUN_STATUSES, RunStore, new_run_id
 from .workers import WorkerRegistry, probe_workers
 
 logger = logging.getLogger("hiveling.server.web")
+
+# Static assets (logo, favicon) shipped alongside the dashboard.
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 EVENTS_TAIL_LINES = 400
 WORKER_PROBE_TIMEOUT = 2.0
@@ -788,6 +792,8 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
         return data
 
     # -------------------------------------------------------------- dashboard
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
     @app.get("/", response_class=HTMLResponse)
     def dashboard() -> str:
         return DASHBOARD_HTML

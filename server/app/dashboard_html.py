@@ -10,6 +10,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" href="/static/favicon.png">
 <title>Hiveling dashboard</title>
 <style>
   :root { --bg:#0f1419; --panel:#171d26; --panel2:#1e2632; --border:#2a3543;
@@ -19,9 +20,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   * { box-sizing:border-box; }
   body { margin:0; font:14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
          background:var(--bg); color:var(--fg); }
-  header { display:flex; align-items:center; gap:16px; padding:10px 16px;
+  header { display:flex; align-items:center; gap:8px; padding:10px 16px;
            background:var(--panel); border-bottom:1px solid var(--border); position:sticky; top:0; z-index:5; }
-  header h1 { font-size:15px; margin:0; letter-spacing:.5px; }
+  header h1 { font-size:15px; margin:0; letter-spacing:.5px; line-height:26px; }
+  header img.logo { width:26px; height:26px; object-fit:contain; display:block; }
   #error-bar { color:var(--failed); }
   .layout { display:grid; grid-template-columns:290px 1fr; min-height:calc(100vh - 44px); }
   .sidebar { border-right:1px solid var(--border); padding:12px; overflow:auto; }
@@ -77,6 +79,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
+  <img class="logo" src="/static/hiveling.png" alt="Hiveling logo">
   <h1>Hiveling</h1>
   <span class="grow"></span>
   <span id="error-bar"></span>
