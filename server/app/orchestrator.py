@@ -1379,9 +1379,10 @@ class Orchestrator:
         files = sorted(set(status.get("added", [])) | set(status.get("modified", [])))
         tokens = status.get("tokens") or {}
         cost = status.get("cost")
+        cost_text = f"{cost:.4f}" if cost is not None else "?"
         self.console.print(
             f"  [{color}]{state}[/] in {status.get('duration_s')}s"
-            f" [dim]| tokens {tokens.get('total', '?')} | cost {cost if cost is not None else '?'}[/]"
+            f" [dim]| tokens {tokens.get('total', '?')} | cost {cost_text}[/]"
         )
         if files:
             self.console.print(f"  changed files: {', '.join(files)}")

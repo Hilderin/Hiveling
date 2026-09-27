@@ -162,6 +162,10 @@ class _EventAccumulator:
         self.texts: list[str] = []
         self.session_id: str | None = None
         self.tools: list[str] = []
+        # Usage is summed over every OpenCode step: a single job emits one
+        # `step_finish` per assistant step, and each carries only that step's
+        # usage. Keeping the last event (the old behaviour) reported the last
+        # step alone instead of the job's real token/cost totals.
         self.tokens: dict | None = None
         self.cost: float | None = None
         self.errors: list[str] = []
@@ -190,12 +194,37 @@ class _EventAccumulator:
                 if tool:
                     self.tools.append(f"{tool}: {title}" if title else str(tool))
             elif event_type in ("step_finish", "step-finish"):
-                if part.get("tokens"):
-                    self.tokens = part["tokens"]
-                if part.get("cost") is not None:
-                    self.cost = part["cost"]
+                self._add_usage(part.get("tokens"), part.get("cost"))
             elif event_type == "error":
                 self.errors.append(self._format_error(event.get("error")))
+
+    def _add_usage(self, tokens: dict | None, cost: float | None) -> None:
+        """Accumulate one step's token counts and cost into the job totals."""
+        if tokens:
+            if self.tokens is None:
+                self.tokens = {
+                    "input": 0,
+                    "output": 0,
+                    "reasoning": 0,
+                    "cache": {"read": 0, "write": 0},
+                }
+            for key in ("input", "output", "reasoning"):
+                if tokens.get(key) is not None:
+                    self.tokens[key] += tokens[key]
+            cache = tokens.get("cache") or {}
+            for key in ("read", "write"):
+                if cache.get(key) is not None:
+                    self.tokens["cache"][key] += cache[key]
+            cache = self.tokens["cache"]
+            self.tokens["total"] = (
+                self.tokens["input"]
+                + self.tokens["output"]
+                + self.tokens["reasoning"]
+                + cache["read"]
+                + cache["write"]
+            )
+        if cost is not None:
+            self.cost = (self.cost or 0.0) + cost
 
     @staticmethod
     def _format_error(error: object) -> str:

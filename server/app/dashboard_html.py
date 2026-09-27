@@ -199,7 +199,19 @@ function fmtTime(ts) { return ts ? new Date(ts*1000).toLocaleString() : ''; }
 function tokenTotal(t) {
   if (!t) return 0;
   if (t.total != null) return t.total;
-  return (t.input||0) + (t.output||0) + (t.reasoning||0);
+  const c = t.cache || {};
+  return (t.input||0) + (t.output||0) + (t.reasoning||0) + (c.read||0) + (c.write||0);
+}
+function fmtNum(n) { return (n||0).toLocaleString(); }
+function fmtCost(c) { return c == null ? '-' : Number(c).toFixed(4); }
+function tokenBreakdown(t) {
+  if (!t) return '-';
+  const c = t.cache || {};
+  const parts = ['in ' + fmtNum(t.input), 'out ' + fmtNum(t.output)];
+  if (t.reasoning) parts.push('reasoning ' + fmtNum(t.reasoning));
+  const cache = (c.read||0) + (c.write||0);
+  if (cache) parts.push('cache ' + fmtNum(cache));
+  return fmtNum(tokenTotal(t)) + ' (' + parts.join(' / ') + ')';
 }
 
 async function refresh(silent) {
@@ -403,8 +415,8 @@ function renderTask() {
     ['model', t.model || '(default)'],
     ['agent', t.agent || '-'],
     ['duration', fmtDur(t.duration_s)],
-    ['tokens', s.tokens ? (tokenTotal(s.tokens) + ' (in ' + (s.tokens.input||0) + ' / out ' + (s.tokens.output||0) + ')') : '-'],
-    ['cost', s.cost != null ? s.cost : '-'],
+    ['tokens', tokenBreakdown(s.tokens)],
+    ['cost', fmtCost(s.cost)],
     ['session', s.session_id || '-'],
     ['depends on', (t.depends_on||[]).join(', ') || '-'],
     ['inputs from', (t.inputs_from||[]).join(', ') || '-'],
