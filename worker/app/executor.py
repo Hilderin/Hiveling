@@ -201,8 +201,18 @@ class _EventAccumulator:
     def _format_error(error: object) -> str:
         if not isinstance(error, dict):
             return str(error) if error else "unknown error"
-        message = (error.get("data") or {}).get("message") or error.get("name") or "unknown error"
-        ref = (error.get("data") or {}).get("ref")
+        data = error.get("data") or {}
+        # OpenCode emits `{type, message}` (e.g. a transport/socket error) and,
+        # for some errors, `{name, data: {message, ref}}`; read both so a real
+        # cause is never collapsed into the bare "unknown error".
+        message = (
+            data.get("message")
+            or error.get("message")
+            or error.get("name")
+            or error.get("type")
+            or "unknown error"
+        )
+        ref = data.get("ref")
         return f"{message} (ref {ref})" if ref else str(message)
 
     def result_text(self) -> str:
