@@ -722,7 +722,7 @@ function renderTaskBody() {
   // Result: what the task produced. Tool calls are not repeated here: they are
   // already visible, formatted, in the Events tab.
   let result = '';
-  if (d.result) result += `<p><b>result</b><pre>${esc(d.result)}</pre></p>`;
+  if (d.result) result += `<pre>${esc(d.result)}</pre>`;
   if (t.error) result += `<p><b>error</b><pre>${esc(t.error)}</pre></p>`;
   if (t.changed_files && t.changed_files.length)
     result += `<p><b>changed files</b><pre>${esc(t.changed_files.join('\n'))}</pre></p>`;
