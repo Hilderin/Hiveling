@@ -2,13 +2,6 @@
 
 ## Open
 
-- Show the token count and cost for a run (counting retries)
-- Allow going back in the browser after navigating in the dashboard.
-- Make a home page on the right side of the dashboard
-- Allow clicking the title in the header bar to return to the home page.
-- Allow modifying a plan while it is running
-- Confirmation when clicking on "Cancel run"
-- Remove the "Refresh" button
 - Add security and authentication to communication with workers
 - Remote execution as a specific Windows user
 - Expose worker resources in the server and MCP (available/total RAM, CPU
@@ -16,8 +9,6 @@
 - Show a run's total execution duration in the runs list and in the run detail
   (do not use the difference between start and end, add the real durations of
   the tasks and retries)
-- Dashboard auto-refresh is disruptive: it interrupts scrolling inside
-  textboxes and collapses open sections such as events
 - Stream a task's events live in the web task detail as they arrive, so you can
   follow what is happening step by step instead of only seeing the final result
 - Show a task's resources in the task detail (git branches are not visible in
@@ -33,6 +24,20 @@
 
 ## Done
 
+- Dashboard: home page (start a run from a stored plan via `GET /api/plans`,
+  recent runs) reached by clicking the title in the header bar
+- Dashboard: run detail shows cumulative tokens/cost across retries (and the
+  attempt count), aggregated from every task's current + archived attempts
+  (`server/app/usage.py`; also in MCP `get_run`)
+- Dashboard: edit a run's plan while it runs (applied to pending tasks between
+  tasks; the snapshot and, for stored plans, the plan file are written).
+  `write_plan` now validates against the run's `base_dir`, so plans using a
+  relative `prompt_file`/`files` can be edited from the snapshot
+- Dashboard: browser back/forward works (pushState + popstate)
+- Dashboard: explicit in-page confirmation before "Cancel run" ("Keep running" /
+  "Cancel run") and before "Resume run"
+- Dashboard: auto-refresh no longer disrupts typing/scrolling or collapses open
+  `<details>` (task body is not rebuilt on poll) and the "Refresh" button is gone
 - Cancel a task
 - Parallel DAG execution (dependencies + available workers; fail fast waits
   for in-flight tasks)

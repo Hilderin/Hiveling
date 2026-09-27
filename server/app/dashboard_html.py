@@ -1,8 +1,11 @@
 """Single-page dashboard served by the server (no build step).
 
 Polling-based, vanilla JS/CSS. It talks to the JSON API exposed in ``web.py``.
-Runs are started by pushing a plan over HTTP (``POST /api/runs``); the UI
-focuses on monitoring (active runs, history) and on retry/cancel/edit.
+Runs are started from the home page (or by pushing a plan over HTTP); the UI
+focuses on monitoring (active runs, history), live plan edits and
+retry/cancel. Navigation updates the URL with pushState so the browser back
+button works, and the periodic refresh never rebuilds the text you are editing
+or scroll/``<details>`` state you opened.
 """
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -22,8 +25,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
          background:var(--bg); color:var(--fg); }
   header { display:flex; align-items:center; gap:8px; padding:10px 16px;
            background:var(--panel); border-bottom:1px solid var(--border); position:sticky; top:0; z-index:5; }
-  header h1 { font-size:15px; margin:0; letter-spacing:.5px; line-height:26px; }
-  header img.logo { width:26px; height:26px; object-fit:contain; display:block; }
+  button.brand { display:flex; align-items:center; gap:8px; background:transparent; border:0;
+                 padding:0; color:var(--fg); cursor:pointer; font:inherit; }
+  button.brand:hover { color:var(--accent); }
+  button.brand h1 { font-size:15px; margin:0; letter-spacing:.5px; line-height:26px; }
+  button.brand img.logo { width:26px; height:26px; object-fit:contain; display:block; }
   #error-bar { color:var(--failed); }
   .layout { display:grid; grid-template-columns:290px 1fr; min-height:calc(100vh - 44px); }
   .sidebar { border-right:1px solid var(--border); padding:12px; overflow:auto; }
@@ -73,6 +79,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .task-title { font-size:16px; font-weight:600; }
   a { color:var(--accent); }
   .hidden { display:none !important; }
+  #confirm-overlay { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:50;
+                     display:flex; align-items:center; justify-content:center; }
+  .confirm-box { max-width:440px; width:calc(100% - 32px); margin:0; }
+  .confirm-box h3 { margin:0 0 6px; font-size:15px; }
   @media (max-width: 900px) {
     .layout { grid-template-columns: 1fr; }
     .sidebar { border-right:0; border-bottom:1px solid var(--border); }
@@ -82,8 +92,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <img class="logo" src="/static/hiveling.png" alt="Hiveling logo">
-  <h1>Hiveling</h1>
+  <button class="brand" type="button" onclick="openHome()" title="Home">
+    <img class="logo" src="/static/hiveling.png" alt="Hiveling logo">
+    <h1>Hiveling</h1>
+  </button>
   <span class="grow"></span>
   <span id="error-bar"></span>
 </header>
@@ -105,13 +117,42 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </aside>
 
   <main class="main">
-    <div id="empty" class="muted">Select a run or open the history.</div>
+    <div id="home-view" class="hidden">
+      <div class="panel">
+        <div class="row">
+          <span class="grow task-title">Home</span>
+          <button class="link" onclick="openHistory()">Browse all runs &rarr;</button>
+        </div>
+        <div class="muted" style="margin-top:6px">
+          Hiveling runs OpenCode plans across workers. Start a run, follow its tasks
+          and gates, and edit a plan live while it runs.
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Start a run</h2>
+        <div class="row" style="margin-bottom:8px">
+          <select id="home-plan" class="grow" style="min-width:200px" aria-label="Plan"></select>
+        </div>
+        <div class="row">
+          <input id="home-only" class="grow" style="min-width:180px"
+                 placeholder="only tasks (comma-separated, optional)" aria-label="only tasks">
+          <button class="primary" onclick="startRun()">Start run</button>
+        </div>
+        <div id="home-msg" class="muted" style="margin-top:6px"></div>
+      </div>
+
+      <div class="panel">
+        <h2>Recent runs</h2>
+        <div id="home-runs"></div>
+      </div>
+    </div>
 
     <div id="history-view" class="hidden">
       <div class="panel">
         <div class="row">
           <span class="grow task-title">History</span>
-          <button onclick="closeHistory()">Close</button>
+          <button onclick="openHome()">Close</button>
         </div>
         <div class="row" style="margin-top:8px">
           <input id="history-search" class="grow" placeholder="search by plan name or run id"
@@ -133,9 +174,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <button id="edit-plan-btn" onclick="openEditor()">Edit plan</button>
           <button id="cancel-btn" class="danger" onclick="cancelRun()">Cancel run</button>
           <button id="resume-btn" onclick="resumeRun()">Resume run</button>
-          <button onclick="refresh(true)">Refresh</button>
         </div>
         <div class="muted" id="run-meta" style="margin-top:6px"></div>
+        <div class="muted" id="run-usage" style="margin-top:2px"></div>
       </div>
 
       <div class="panel">
@@ -150,6 +191,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <button onclick="closeEditor()">Close</button>
           <span id="editor-msg" class="muted"></span>
         </div>
+        <div id="editor-hint" class="muted" style="margin-bottom:6px"></div>
         <textarea id="editor-text"></textarea>
       </div>
     </div>
@@ -168,11 +210,27 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </main>
 </div>
 
+<div id="confirm-overlay" class="hidden">
+  <div class="panel confirm-box">
+    <h3 id="confirm-title"></h3>
+    <div id="confirm-body" class="muted"></div>
+    <div class="row" style="justify-content:flex-end; margin-top:12px">
+      <button id="confirm-no" type="button"></button>
+      <button id="confirm-yes" class="danger" type="button"></button>
+    </div>
+  </div>
+</div>
+
 <script>
 const state = {
   workers: [], activeRuns: [], run: null, runDetail: null, task: null, taskDetail: null,
-  editing: null, view: 'run', history: { runs: [], total: 0, limit: 20, offset: 0 }
+  editing: null, view: 'home',
+  history: { runs: [], total: 0, limit: 20, offset: 0 },
+  home: { plans: [], runs: [] }
 };
+// True while route() is applying a URL (init/deep link/back/forward): setUrl then
+// replaces the current entry instead of pushing a new one.
+let fromRoute = false;
 
 function reportError(msg) {
   const el = document.getElementById('error-bar');
@@ -213,8 +271,17 @@ function tokenBreakdown(t) {
   if (cache) parts.push('cache ' + fmtNum(cache));
   return fmtNum(tokenTotal(t)) + ' (' + parts.join(' / ') + ')';
 }
+function runSummary(r) {
+  const c = r.counts || {};
+  return Object.entries(c).map(([k,v]) => `${k}:${v}`).join(' ');
+}
 
+// -------------------------------------------------------------------- refresh
+let refreshing = false;
 async function refresh(silent) {
+  if (refreshing) return;
+  if (document.hidden) return;  // do not disturb a background tab
+  refreshing = true;
   try {
     const [workers, active] = await Promise.all([
       api('/api/workers'),
@@ -224,9 +291,13 @@ async function refresh(silent) {
     state.activeRuns = active.runs;
     reportError('');
     renderWorkers(); renderActiveRuns();
-    if (state.run) await loadRun(state.run, true);
     if (state.view === 'history') await loadHistory(state.history.offset);
+    else if (state.view === 'home') await loadHomeRuns();
+    if (state.run && (state.view === 'run' || state.view === 'task')) {
+      await loadRun(state.run, true);
+    }
   } catch (e) { if (!silent) reportError(e.message); }
+  finally { refreshing = false; }
 }
 
 function renderWorkers() {
@@ -252,6 +323,70 @@ function renderActiveRuns() {
   }).join('');
 }
 
+// ------------------------------------------------------------------- home
+async function loadHome() {
+  await Promise.all([loadHomePlans(), loadHomeRuns()]);
+}
+
+async function loadHomePlans() {
+  try {
+    const data = await api('/api/plans');
+    state.home.plans = data.plans || [];
+    renderHomePlans();
+  } catch (e) { reportError(e.message); }
+}
+
+async function loadHomeRuns() {
+  try {
+    const data = await api('/api/runs?status=all&limit=8&offset=0');
+    state.home.runs = data.runs || [];
+    renderHomeRuns();
+  } catch (e) { reportError(e.message); }
+}
+
+function renderHomePlans() {
+  const sel = document.getElementById('home-plan');
+  const previous = sel.value;
+  const plans = state.home.plans || [];
+  sel.innerHTML = plans.length
+    ? plans.map(p => `<option value="${esc(p.name)}"${p.error ? ' disabled' : ''}>` +
+        `${esc(p.name)} (${p.task_count} task${p.task_count === 1 ? '' : 's'})` +
+        `${p.error ? ' — invalid' : ''}</option>`).join('')
+    : '<option value="">no plans found</option>';
+  if (plans.some(p => p.name === previous)) sel.value = previous;
+}
+
+function renderHomeRuns() {
+  const runs = state.home.runs || [];
+  document.getElementById('home-runs').innerHTML = runs.map(r => {
+    return `<button class="runitem history" onclick="openRun('${r.run_id}')">
+      <span class="dot ${r.status}"></span><b>${esc(r.plan_name)}</b>
+      <span class="muted">${esc(r.status)} &middot; ${fmtTime(r.created_at)} &middot; ${r.task_count} tasks</span>
+      <div class="muted" style="font-size:12px">${esc(r.run_id)} &middot; ${runSummary(r)}</div>
+    </button>`;
+  }).join('') || '<div class="muted">no runs yet</div>';
+}
+
+async function startRun() {
+  const plan = document.getElementById('home-plan').value;
+  const only = document.getElementById('home-only').value
+    .split(',').map(s => s.trim()).filter(Boolean);
+  const msg = document.getElementById('home-msg');
+  if (!plan) { msg.textContent = ' select a plan'; return; }
+  msg.textContent = ' starting...';
+  try {
+    const data = await api('/api/runs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ plan, only })
+    });
+    msg.textContent = ' started ' + data.run_id;
+    await loadHomeRuns();
+    openRun(data.run_id);
+  } catch (e) { msg.textContent = ' ' + e.message; }
+}
+
+// ------------------------------------------------------------------ history
 async function loadHistory(offset) {
   try {
     const search = document.getElementById('history-search');
@@ -266,12 +401,10 @@ async function loadHistory(offset) {
 function renderHistory() {
   const h = state.history;
   document.getElementById('history-list').innerHTML = h.runs.map(r => {
-    const c = r.counts || {};
-    const summary = Object.entries(c).map(([k,v]) => `${k}:${v}`).join(' ');
     return `<button class="runitem history" onclick="openRun('${r.run_id}')">
       <span class="dot ${r.status}"></span><b>${esc(r.plan_name)}</b>
       <span class="muted">${esc(r.status)} &middot; ${fmtTime(r.created_at)} &middot; ${r.task_count} tasks</span>
-      <div class="muted" style="font-size:12px">${esc(r.run_id)} &middot; ${summary}</div>
+      <div class="muted" style="font-size:12px">${esc(r.run_id)} &middot; ${runSummary(r)}</div>
     </button>`;
   }).join('') || '<div class="muted">no runs</div>';
   const from = h.total ? h.offset + 1 : 0;
@@ -291,21 +424,35 @@ function historyPage(delta) {
 
 async function openHistory() {
   state.view = 'history';
-  showView();
+  state.run = null; state.runDetail = null;
+  state.task = null; state.taskDetail = null;
+  showView(); setUrl();
   await loadHistory(0);
-  setUrl();
 }
-function closeHistory() { state.view = 'run'; showView(); setUrl(); }
-
+// ------------------------------------------------------------------ views
 function showView() {
-  const view = state.view;
+  let view = state.view;
+  if (view === 'run' && !state.runDetail) view = 'home';
+  if (view === 'task' && !state.taskDetail) view = 'home';
+  const home = view === 'home';
   const history = view === 'history';
-  const task = view === 'task' && !!state.taskDetail;
-  const run = !history && !task && !!state.runDetail;
+  const task = view === 'task';
+  const run = view === 'run';
+  document.getElementById('home-view').classList.toggle('hidden', !home);
   document.getElementById('history-view').classList.toggle('hidden', !history);
   document.getElementById('run-view').classList.toggle('hidden', !run);
   document.getElementById('task-view').classList.toggle('hidden', !task);
-  document.getElementById('empty').classList.toggle('hidden', history || run || task);
+}
+
+function openHome() {
+  state.view = 'home';
+  state.run = null; state.runDetail = null;
+  state.task = null; state.taskDetail = null;
+  state.editing = null;
+  document.getElementById('editor-panel').classList.add('hidden');
+  renderActiveRuns();
+  showView(); setUrl();
+  loadHome();
 }
 
 function openRun(runId) { loadRun(runId); }
@@ -327,12 +474,13 @@ async function loadRun(runId, keepTask) {
     state.view = 'run';
     document.getElementById('editor-panel').classList.add('hidden');
   }
-  renderActiveRuns(); renderRun(); showView(); setUrl();
-  if (state.view === 'task' && state.task) await loadTask(state.task, true);
+  renderRun(); renderActiveRuns(); showView(); setUrl();
+  if (state.view === 'task' && state.task) renderTaskHeader();
 }
 
 function renderRun() {
   const d = state.runDetail;
+  if (!d) return;
   document.getElementById('run-title').textContent = d.plan_name + '  (' + d.run_id + ')';
   const c = d.tasks.reduce((a,t) => (a[t.status]=(a[t.status]||0)+1, a), {});
   const gates = d.tasks.filter(t => t.kind === 'gate').length;
@@ -343,6 +491,11 @@ function renderRun() {
     ` &middot; started ${fmtTime(d.started_at)}` +
     (d.finished_at ? ` &middot; finished ${fmtTime(d.finished_at)}` : '') +
     (d.error ? ` &middot; <span class="failed">${esc(d.error)}</span>` : '');
+  const usage = d.usage || {};
+  const attempts = usage.attempts || 0;
+  document.getElementById('run-usage').innerHTML =
+    `tokens ${tokenBreakdown(usage.tokens)} &middot; cost ${fmtCost(usage.cost)}` +
+    ` &middot; attempts ${attempts}`;
   document.getElementById('cancel-btn').classList.toggle('hidden', d.status !== 'running');
   document.getElementById('tree').innerHTML = renderTree(d.tasks);
 }
@@ -380,20 +533,22 @@ function renderTree(tasks) {
   return '<ul class="tree">' + items + '</ul>';
 }
 
-async function loadTask(taskId, keepView) {
+// ------------------------------------------------------------------- tasks
+async function loadTask(taskId) {
   state.task = taskId;
   try { state.taskDetail = await api('/api/runs/' + encodeURIComponent(state.run) + '/tasks/' + encodeURIComponent(taskId)); }
   catch (e) { reportError(e.message); return; }
   state.view = 'task';
+  renderTaskHeader();
+  renderTaskBody();
   renderRun();
-  renderTask();
-  showView();
-  setUrl();
+  showView(); setUrl();
 }
 
-function renderTask() {
-  const t = state.runDetail.tasks.find(x => x.id === state.task);
-  const d = state.taskDetail || {};
+// Cheap, refresh-safe part of the task view (status/worker/model change live).
+function renderTaskHeader() {
+  const t = state.runDetail && state.runDetail.tasks.find(x => x.id === state.task);
+  if (!t) return;
   const isGate = t.kind === 'gate';
   document.getElementById('task-kind').classList.toggle('hidden', !isGate);
   document.getElementById('task-title').innerHTML = `<span class="dot ${t.status}"></span>${esc(t.id)}`;
@@ -406,6 +561,15 @@ function renderTask() {
   dl.textContent = isGate ? 'Download decision material' : 'Download files';
   dl.href = `/api/runs/${encodeURIComponent(state.run)}/tasks/${encodeURIComponent(t.id)}/` +
     (isGate ? 'gate-input' : 'files');
+}
+
+// Rebuilt only when a task is opened: the periodic refresh deliberately leaves
+// it alone so scroll position and open <details> (events, stderr) survive.
+function renderTaskBody() {
+  const t = state.runDetail.tasks.find(x => x.id === state.task);
+  if (!t) return;
+  const d = state.taskDetail || {};
+  const isGate = t.kind === 'gate';
   const s = d.status || {};
   const rows = [
     ['kind', t.kind || 'task'],
@@ -442,8 +606,50 @@ function renderTask() {
   document.getElementById('task-body').innerHTML = html;
 }
 
+// ------------------------------------------------------------------ actions
+// In-page confirmation (no native dialog): explicit labels and observable in
+// the browser preview, so "keep" and "confirm" are never confused.
+function askConfirm(opts) {
+  return new Promise(resolve => {
+    const overlay = document.getElementById('confirm-overlay');
+    const yes = document.getElementById('confirm-yes');
+    const no = document.getElementById('confirm-no');
+    document.getElementById('confirm-title').textContent = opts.title || 'Please confirm';
+    document.getElementById('confirm-body').textContent = opts.body || '';
+    yes.textContent = opts.confirmLabel || 'Confirm';
+    no.textContent = opts.dismissLabel || 'Keep';
+    const done = value => {
+      overlay.classList.add('hidden');
+      yes.removeEventListener('click', onYes);
+      no.removeEventListener('click', onNo);
+      overlay.removeEventListener('click', onOverlay);
+      document.removeEventListener('keydown', onKey);
+      resolve(value);
+    };
+    const onYes = () => done(true);
+    const onNo = () => done(false);
+    const onOverlay = ev => { if (ev.target === overlay) done(false); };
+    const onKey = ev => { if (ev.key === 'Escape') done(false); };
+    yes.addEventListener('click', onYes);
+    no.addEventListener('click', onNo);
+    overlay.addEventListener('click', onOverlay);
+    document.addEventListener('keydown', onKey);
+    overlay.classList.remove('hidden');
+    // Focus the safe option: Enter/Space never triggers the destructive action.
+    no.focus();
+  });
+}
+
 async function cancelRun() {
   if (!state.run) return;
+  const label = (state.runDetail && state.runDetail.plan_name) || state.run;
+  const ok = await askConfirm({
+    title: 'Cancel this run?',
+    body: label + ' — running tasks are stopped and pending tasks are canceled.',
+    confirmLabel: 'Cancel run',
+    dismissLabel: 'Keep running'
+  });
+  if (!ok) return;
   try { await api('/api/runs/' + encodeURIComponent(state.run) + '/cancel', { method:'POST' }); }
   catch (e) { reportError(e.message); }
   await refresh(true);
@@ -451,6 +657,13 @@ async function cancelRun() {
 
 async function resumeRun() {
   if (!state.run) return;
+  const ok = await askConfirm({
+    title: 'Resume this run?',
+    body: state.run + ' — failed and skipped tasks are re-armed.',
+    confirmLabel: 'Resume run',
+    dismissLabel: 'Keep'
+  });
+  if (!ok) return;
   try { await api('/api/runs/' + encodeURIComponent(state.run) + '/resume', { method:'POST' }); }
   catch (e) { reportError(e.message); }
   await refresh(true);
@@ -464,6 +677,10 @@ async function openEditor() {
     document.getElementById('editor-panel').classList.remove('hidden');
     document.getElementById('editor-title').textContent = 'Edit ' + data.name;
     document.getElementById('editor-msg').textContent = '';
+    const running = state.runDetail && state.runDetail.status === 'running';
+    document.getElementById('editor-hint').textContent = running
+      ? 'This run is active: saving applies the change to its pending tasks between tasks; running and finished tasks keep the plan they started with.'
+      : 'Saving applies the change to this run and, when it is a stored plan, to the plan file.';
     document.getElementById('editor-text').value = data.content;
   } catch (e) { reportError(e.message); }
 }
@@ -478,40 +695,49 @@ async function savePlan() {
       { method:'PUT', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ content: document.getElementById('editor-text').value }) });
     msg.textContent = ' saved';
+    if (state.run) loadRun(state.run, true);
   } catch (e) { msg.textContent = ' ' + e.message; }
 }
 
-function setUrl() {
-  let path = '/';
-  if (state.view === 'history') {
-    path = '/history';
-  } else if (state.view === 'task' && state.run && state.task) {
+// ---------------------------------------------------------------- routing
+function currentPath() {
+  if (state.view === 'history') return '/history';
+  if (state.view === 'task' && state.run && state.task) {
     const t = state.runDetail && state.runDetail.tasks.find(x => x.id === state.task);
     const seg = (t && t.kind === 'gate') ? 'gate' : 'task';
-    path = `/run/${encodeURIComponent(state.run)}/${seg}/${encodeURIComponent(state.task)}`;
-  } else if (state.run) {
-    path = `/run/${encodeURIComponent(state.run)}`;
+    return `/run/${encodeURIComponent(state.run)}/${seg}/${encodeURIComponent(state.task)}`;
   }
-  if (location.pathname + location.search !== path) history.replaceState(null, '', path);
+  if (state.run) return `/run/${encodeURIComponent(state.run)}`;
+  return '/';
+}
+
+function setUrl() {
+  const path = currentPath();
+  if (location.pathname + location.search === path) return;
+  if (fromRoute) window.history.replaceState(null, '', path);
+  else window.history.pushState(null, '', path);
 }
 
 async function route() {
-  const parts = location.pathname.split('/').filter(Boolean);
-  if (parts[0] === 'history') { await openHistory(); return; }
-  if (parts[0] === 'run' && parts[1]) {
-    const runId = decodeURIComponent(parts[1]);
-    if (parts[2] && parts[3]) {
-      await loadRun(runId, true);
-      await loadTask(decodeURIComponent(parts[3]));
-    } else {
-      await loadRun(runId);
+  fromRoute = true;
+  try {
+    const parts = location.pathname.split('/').filter(Boolean);
+    if (parts[0] === 'history') { await openHistory(); return; }
+    if (parts[0] === 'run' && parts[1]) {
+      const runId = decodeURIComponent(parts[1]);
+      if (parts[2] && parts[3]) {
+        await loadRun(runId, true);
+        await loadTask(decodeURIComponent(parts[3]));
+      } else {
+        await loadRun(runId);
+      }
+      return;
     }
-    return;
-  }
-  state.view = 'run';
-  showView();
-  setUrl();
+    openHome();
+  } finally { fromRoute = false; }
 }
+
+window.addEventListener('popstate', () => { route(); });
 
 (async function init() {
   try {

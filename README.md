@@ -144,22 +144,35 @@ The layout:
   `workers.yaml`; workers added while the server runs appear without a restart)
   and **Active runs** (compact list of runs still
   running, with `done/total` tasks);
+- **home** (right pane, also reached by clicking **Hiveling** in the header):
+  start a run from a stored plan (optional `only` task list), and the most
+  recent runs;
 - **History** link: full list of runs, newest first, with a search box (plan
   name or run id) and pagination;
 - run view: task tree with each task's state (`pending`/`running`/`succeeded`/
-  `failed`/`skipped`/`canceled`);
+  `failed`/`skipped`/`canceled`) and the run's **cumulative tokens and cost**
+  across every attempt (resume, gate re-arm, re-dispatch), plus the number of
+  attempts;
 - task detail: worker, job id, model, duration, tokens, cost, session, error,
   changed files (download as zip), result, tool calls, prompt, events, stderr;
-- actions: cancel a running run, cancel a single task, retry a task, view/edit
-  the run's plan (plans under `.data/plans`, i.e. pushed plans, are editable;
-  example plans are read-only from the dashboard).
+- actions: cancel a running run (with confirmation), resume a finished run,
+  cancel a single task, retry a task, and view/edit the run's plan **while it
+  runs** (the change is applied between tasks to the pending ones; running and
+  finished tasks keep the plan they started with). Plans under `.data/plans`,
+  i.e. pushed plans, are written back too; example plans stay read-only.
 
-Runs are started by **pushing a plan over HTTP** (there is no run form in the
-UI). Runs execute in background threads; if the dashboard restarts while a run
-is active, that run is **recovered** on the next startup (see
+Navigation updates the URL with `pushState` (browser back/forward works). The
+2 s auto-refresh only updates live status: it never rebuilds the plan editor you
+are typing in, nor the task body, so scroll position and open `<details>`
+(events, stderr) survive.
+
+Runs can also be started by **pushing a plan over HTTP** (`POST /api/runs`).
+Runs execute in background threads; if the dashboard restarts while a run is
+active, that run is **recovered** on the next startup (see
 [Persistence, recovery and live edits](#persistence-recovery-and-live-edits)).
 
-Deep links: `?run=<run_id>`, `?run=<run_id>&task=<task_id>`, `?view=history`.
+Deep links: `/run/<run_id>`, `/run/<run_id>/task/<task_id>` (or
+`/run/<run_id>/gate/<gate_id>`), `/history`.
 
 API:
 
@@ -170,8 +183,10 @@ API:
   directory (`--plans-dir`). Example plans live in `examples/` and are meant for
   the CLI or as starting points.
 - `GET /api/runs?status=active|all&q=<search>&limit=&offset=` — paginated runs.
-- `GET /api/runs/{id}`, `POST /api/runs/{id}/cancel`,
-  `POST /api/runs/{id}/resume`,
+- `GET /api/plans` — stored plans (name, task count, editable) for the home page.
+- `GET /api/runs/{id}` — run state including its cumulative `usage`
+  (`tokens`/`cost`/`attempts`, per task and overall).
+- `POST /api/runs/{id}/cancel`, `POST /api/runs/{id}/resume`,
   `GET /api/runs/{id}/wait?timeout_s=&until=` (long-poll run state),
   `POST /api/runs/{id}/tasks/{task}/cancel`,
   `GET /api/runs/{id}/tasks/{task}`,

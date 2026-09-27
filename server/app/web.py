@@ -32,7 +32,9 @@ from .orchestrator import Orchestrator
 from .plan import PlanError, load_plan
 from .plan_files import (
     is_editable_plan,
+    list_plan_files,
     persist_pushed_plan,
+    plan_name,
     plan_summary,
     resolve_known_plan,
     write_plan,
@@ -40,6 +42,7 @@ from .plan_files import (
 from .readers import read_json, read_text, zip_dir
 from .redact import make_redactor
 from .runs import TERMINAL_RUN_STATUSES, RunStore, new_run_id
+from .usage import run_usage
 from .workers import WorkerRegistry, probe_workers
 
 logger = logging.getLogger("hiveling.server.web")
@@ -542,11 +545,14 @@ class RunManager:
         target = self.run_plan_file(run_id)
         if target is None:
             raise PlanError("no plan file for this run")
-        write_plan(target, content)
+        # The snapshot lives under the run dir, so relative prompt_file/files
+        # paths must still resolve against the plan's original base directory.
+        base_dir = Path(run["base_dir"]) if run.get("base_dir") else None
+        write_plan(target, content, base_dir=base_dir)
         source = run.get("plan_path")
         if source and is_editable_plan(self.config.plans_dir, self.config.data_dir, Path(source)):
             if Path(source).resolve() != target.resolve():
-                write_plan(Path(source), content)
+                write_plan(Path(source), content, base_dir=base_dir)
         logger.info("run %s: plan updated (%s)", run_id, target)
         return target
 
@@ -675,6 +681,9 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
         if run is None:
             raise HTTPException(status_code=404, detail="run not found")
         run["active"] = manager.is_active(run_id)
+        # Cumulative tokens/cost across every task and retry (read before
+        # redaction removes the tasks' history paths).
+        run["usage"] = run_usage(run, config.history_dir)
         return redact(run)
 
     @app.post("/api/runs/{run_id}/cancel")
@@ -823,6 +832,25 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
                 "Content-Disposition": f'attachment; filename="{task_id}-gate-input.zip"'
             },
         )
+
+    # ----------------------------------------------------------------- plans
+    @app.get("/api/plans")
+    def api_plans() -> dict:
+        """Stored plans the home page can start a run from."""
+        plans = []
+        for path in list_plan_files(config.plans_dir):
+            summary = plan_summary(path)
+            plans.append(
+                {
+                    "name": plan_name(config.plans_dir, path),
+                    "editable": is_editable_plan(
+                        config.plans_dir, config.data_dir, path
+                    ),
+                    "task_count": len(summary["tasks"]),
+                    "error": summary["error"] or "",
+                }
+            )
+        return redact({"plans": plans})
 
     # ---------------------------------------------------------------- workers
     @app.get("/api/workers")

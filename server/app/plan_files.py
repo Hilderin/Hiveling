@@ -97,12 +97,17 @@ def persist_pushed_plan(pushed_plans_dir: Path, name: str | None, content: str) 
     return target
 
 
-def write_plan(path: Path, content: str) -> None:
-    """Validate ``content`` then atomically replace ``path``."""
+def write_plan(path: Path, content: str, *, base_dir: Path | None = None) -> None:
+    """Validate ``content`` then atomically replace ``path``.
+
+    ``base_dir`` is passed to :func:`load_plan` so a plan edited through its run
+    snapshot still resolves its relative ``prompt_file``/``files`` against the
+    original plan directory instead of the snapshot directory.
+    """
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(content, encoding="utf-8")
     try:
-        load_plan(tmp)
+        load_plan(tmp, base_dir=base_dir)
     except PlanError:
         tmp.unlink(missing_ok=True)
         raise

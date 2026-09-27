@@ -34,6 +34,7 @@ from .plan_files import (
 from .plan_schema import PLAN_EXAMPLE, PLAN_REFERENCE, PlanInput, plan_to_yaml
 from .readers import read_json, read_text
 from .redact import make_redactor
+from .usage import run_usage
 from .workers import probe_workers
 
 EVENTS_TAIL_LINES = 200
@@ -315,6 +316,7 @@ def create_mcp_server(manager, config) -> MCPServer:
         if run is None:
             raise ToolError(f"run not found: {run_id}")
         run["active"] = manager.is_active(run_id)
+        run["usage"] = run_usage(run, config.history_dir)
         return redact(run)
 
     @mcp.tool()
