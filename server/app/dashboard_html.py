@@ -322,7 +322,18 @@ function fmtEvent(line) {
       const title = (state.input && (state.input.command || state.input.filePath || state.input.path))
         || state.title || '';
       let out = tag('tool') + tool + (title ? ': ' + title : '');
-      const output = state.output || (state.metadata && state.metadata.output);
+      let output = state.output != null ? state.output : (state.metadata && state.metadata.output);
+      if (typeof output === 'string') {
+        // The shell tool sometimes returns a JSON envelope {exit, output, ...};
+        // unwrap it so the line shows the real output (or the exit code).
+        try {
+          const parsed = JSON.parse(output);
+          if (parsed && typeof parsed === 'object' && 'output' in parsed) {
+            const inner = String(parsed.output == null ? '' : parsed.output).trim();
+            output = inner || ('exit ' + (parsed.exit != null ? parsed.exit : '?'));
+          }
+        } catch (e) { /* not JSON: keep the raw output */ }
+      }
       if (output) {
         const first = String(output).split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
         if (first && first !== title) out += ' \u2192 ' + first.slice(0, 160);
