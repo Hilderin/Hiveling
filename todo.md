@@ -5,6 +5,7 @@
 - Add security and authentication to communication with workers
 - Remote execution as a specific Windows user
 - Versioned plan mutations
+- Encrypted communication between server and workers
 
 ## Done
 

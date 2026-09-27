@@ -83,6 +83,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   button.tab:hover { color:var(--fg); }
   button.tab.active { background:var(--panel2); border-color:var(--border); color:var(--fg); }
   #task-body .tabpane[data-pane="events"] pre { max-height:60vh; }
+  #task-body pre.error { border-color:var(--failed); }
+  #task-body b.error-label { color:var(--failed); }
   #task-body .tabpane p:first-child { margin-top:0; }
   a { color:var(--accent); }
   .hidden { display:none !important; }
@@ -719,11 +721,12 @@ function renderTaskBody() {
   if (d.request && d.request.prompt)
     overview += `<p><b>prompt</b><pre>${esc(d.request.prompt)}</pre></p>`;
 
-  // Result: what the task produced. Tool calls are not repeated here: they are
-  // already visible, formatted, in the Events tab.
+  // Result: what the task produced. The result itself is unlabeled (the tab is
+  // already "Result"); an error is an exceptional state, so it gets a label and
+  // a distinct red frame. Tool calls live in the Events tab.
   let result = '';
   if (d.result) result += `<pre>${esc(d.result)}</pre>`;
-  if (t.error) result += `<p><b>error</b><pre>${esc(t.error)}</pre></p>`;
+  if (t.error) result += `<p><b class="error-label">error</b></p><pre class="error">${esc(t.error)}</pre>`;
   if (t.changed_files && t.changed_files.length)
     result += `<p><b>changed files</b><pre>${esc(t.changed_files.join('\n'))}</pre></p>`;
   if (!result) result = '<div class="muted">no result yet</div>';
