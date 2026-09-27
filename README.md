@@ -155,11 +155,12 @@ The layout:
   of every task's real duration across all retries, not start-to-end wall clock)
   and its **cumulative tokens and cost** across every attempt (resume, gate
   re-arm, re-dispatch), plus the number of attempts;
-- task detail: worker, job id, model, duration, tokens, cost, session, error,
-  **resources** (including the resolved git branches), changed files (download
-  as zip), result, tool calls, prompt, **live events** streamed step by step and
-  formatted as console-style lines while the task runs, plus the saved events and
-  stderr;
+- task detail: **tabbed** (Overview / Events / Result / stderr). Overview has the
+  identity, worker, job id, model, duration, tokens, cost, session, **resources**
+  (including the resolved git branches) and prompt; Result has the result, tool
+  calls, error and changed files (download as zip); Events streams the log
+  **live** and formats it as console-style lines while the task runs, then shows
+  the saved log once it is done;
 - runs list and history show each run's total duration next to its status;
 - actions: cancel a running run (with confirmation), resume a finished run,
   cancel a single task, retry a task, and view/edit the run's plan **while it
@@ -169,8 +170,8 @@ The layout:
 
 Navigation updates the URL with `pushState` (browser back/forward works). The
 2 s auto-refresh only updates live status: it never rebuilds the plan editor you
-are typing in, nor the task body, so scroll position and open `<details>`
-(events, stderr) survive.
+are typing in, nor the task body, so scroll position, the selected tab and the
+live event stream survive.
 
 Runs can also be started by **pushing a plan over HTTP** (`POST /api/runs`).
 Runs execute in background threads; if the dashboard restarts while a run is

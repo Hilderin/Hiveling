@@ -77,6 +77,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   td, th { text-align:left; padding:3px 8px 3px 0; vertical-align:top; }
   th { color:var(--muted); font-weight:400; width:110px; }
   .task-title { font-size:16px; font-weight:600; }
+  .tabs { display:flex; gap:4px; border-bottom:1px solid var(--border); margin:0 0 10px; flex-wrap:wrap; }
+  button.tab { background:transparent; border:1px solid transparent; border-bottom:0;
+               border-radius:6px 6px 0 0; padding:4px 10px; color:var(--muted); }
+  button.tab:hover { color:var(--fg); }
+  button.tab.active { background:var(--panel2); border-color:var(--border); color:var(--fg); }
+  #task-body .tabpane[data-pane="events"] pre { max-height:60vh; }
+  #task-body .tabpane p:first-child { margin-top:0; }
   a { color:var(--accent); }
   .hidden { display:none !important; }
   #confirm-overlay { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:50;
@@ -258,15 +265,13 @@ function fmtRam(free, total) {
   if (total == null) return '';
   const gb = 1024 * 1024 * 1024;
   const freeText = free == null ? '?' : Math.round(free/gb*10)/10;
-  const totalText = total/gb >= 10 ? Math.round(total/gb) : Math.round(total/gb*10)/10;
-  return 'ram ' + freeText + ' / ' + totalText + ' GiB';
+  return 'ram ' + freeText + ' / ' + Math.round(total/gb) + ' G';
 }
 function workerResources(w) {
   const r = w.resources || {};
   const parts = [];
   if (r.cpu_count != null) {
-    parts.push('cpu ' + r.cpu_count + (r.cpu_count_physical ? '/' + r.cpu_count_physical + 'c' : '') +
-      (r.cpu_speed_mhz ? ' @ ' + Math.round(r.cpu_speed_mhz) + ' MHz' : ''));
+    parts.push('cpu ' + r.cpu_count + (r.cpu_speed_mhz ? 'x' + Math.round(r.cpu_speed_mhz) + ' MHz' : ''));
   }
   const ram = fmtRam(r.ram_available_bytes, r.ram_total_bytes);
   if (ram) parts.push(ram);
@@ -674,13 +679,17 @@ function renderTaskHeader() {
 }
 
 // Rebuilt only when a task is opened: the periodic refresh deliberately leaves
-// it alone so scroll position and open <details> (events, stderr) survive.
+// it alone so scroll position, the selected tab and the live stream survive.
+let taskTab = 'overview';
+let taskTabFor = null;
+
 function renderTaskBody() {
   const t = state.runDetail.tasks.find(x => x.id === state.task);
   if (!t) return;
   const d = state.taskDetail || {};
   const isGate = t.kind === 'gate';
   const s = d.status || {};
+  const live = t.status === 'pending' || t.status === 'running';
   const rows = [
     ['kind', t.kind || 'task'],
     ['status', `${t.status}${s.exit_code!=null?' (exit '+s.exit_code+')':''}`],
@@ -700,30 +709,59 @@ function renderTaskBody() {
     rows.push(['attempt', `${t.gate_attempt||0} of ${t.gate_max_attempts||0}`]);
     rows.push(['verdict', t.gate_verdict || (t.status === 'succeeded' ? 'VALID' : '-')]);
   }
-  let html = '<table>' + rows.map(([k,v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join('') + '</table>';
-  if (d.resources && d.resources.length) {
-    html += `<p><b>resources</b><pre>${esc(d.resources.map(fmtResource).join('\n\n'))}</pre></p>`;
-  }
+
+  // Overview: identity, resources and the prompt.
+  let overview = '<table>' + rows.map(([k,v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join('') + '</table>';
+  if (d.resources && d.resources.length)
+    overview += `<p><b>resources</b><pre>${esc(d.resources.map(fmtResource).join('\n\n'))}</pre></p>`;
   if (isGate && t.gate_feedback)
-    html += `<p><b>last gate feedback</b><pre>${esc(t.gate_feedback)}</pre></p>`;
+    overview += `<p><b>last gate feedback</b><pre>${esc(t.gate_feedback)}</pre></p>`;
   if (d.request && d.request.prompt)
-    html += `<p><b>prompt</b><pre>${esc(d.request.prompt)}</pre></p>`;
+    overview += `<p><b>prompt</b><pre>${esc(d.request.prompt)}</pre></p>`;
+
+  // Result: what the task produced.
+  let result = '';
   if (s.tool_calls && s.tool_calls.length)
-    html += `<p><b>tool calls</b><pre>${esc(s.tool_calls.join('\n'))}</pre></p>`;
-  if (d.result) html += `<p><b>result</b><pre>${esc(d.result)}</pre></p>`;
-  if (t.error) html += `<p><b>error</b><pre>${esc(t.error)}</pre></p>`;
+    result += `<p><b>tool calls</b><pre>${esc(s.tool_calls.join('\n'))}</pre></p>`;
+  if (d.result) result += `<p><b>result</b><pre>${esc(d.result)}</pre></p>`;
+  if (t.error) result += `<p><b>error</b><pre>${esc(t.error)}</pre></p>`;
   if (t.changed_files && t.changed_files.length)
-    html += `<p><b>changed files</b><pre>${esc(t.changed_files.join('\n'))}</pre></p>`;
-  const live = t.status === 'pending' || t.status === 'running';
-  if (live)
-    html += `<details open><summary>live events</summary><pre id="live-events"></pre></details>`;
-  if (d.events) html += `<details><summary>events (${d.event_lines} lines)</summary><pre>${esc(fmtEvents(d.events))}</pre></details>`;
-  if (d.stderr) html += `<details><summary>stderr</summary><pre>${esc(d.stderr)}</pre></details>`;
+    result += `<p><b>changed files</b><pre>${esc(t.changed_files.join('\n'))}</pre></p>`;
+  if (!result) result = '<div class="muted">no result yet</div>';
+
+  // Events: live while running, saved once finished.
+  let events = '';
+  if (live) events += '<pre id="live-events" style="min-height:180px"></pre>';
+  if (d.events) events += `<pre>${esc(fmtEvents(d.events))}</pre>`;
+  if (!events) events = '<div class="muted">no events yet</div>';
+
+  const tabs = [['overview', 'Overview'], ['events', 'Events'], ['result', 'Result']];
+  if (d.stderr) tabs.push(['stderr', 'stderr']);
+  if (taskTabFor !== t.id || !tabs.some(([id]) => id === taskTab)) {
+    taskTabFor = t.id;
+    taskTab = live ? 'events' : 'overview';
+  }
+  const tabBar = '<div class="tabs" id="task-tabs">' + tabs.map(([id, label]) =>
+    `<button type="button" class="tab${id===taskTab?' active':''}" data-tab="${id}" ` +
+    `onclick="showTaskTab('${id}')">${esc(label)}</button>`).join('') + '</div>';
+  const pane = (id, content) =>
+    `<div class="tabpane${id===taskTab?'':' hidden'}" data-pane="${id}">${content}</div>`;
+  let html = tabBar + pane('overview', overview) + pane('events', events) + pane('result', result);
+  if (d.stderr) html += pane('stderr', `<pre>${esc(d.stderr)}</pre>`);
   document.getElementById('task-body').innerHTML = html;
   // The body is rebuilt on every open, so (re)bind the live event stream to the
   // fresh <pre>; the periodic refresh never calls this, so the stream persists.
   if (live) startTaskStream(state.run, t.id);
   else stopTaskStream();
+}
+
+// Switch panes without rebuilding the body, so the live stream keeps running.
+function showTaskTab(name) {
+  taskTab = name;
+  document.querySelectorAll('#task-tabs .tab').forEach(b =>
+    b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('#task-body .tabpane').forEach(p =>
+    p.classList.toggle('hidden', p.dataset.pane !== name));
 }
 
 // ------------------------------------------------------- live event stream
