@@ -276,9 +276,10 @@ Decision rules:
   attempts) stops new dispatches, but tasks already running finish; the rest are
   `skipped` (`skip_reason`) or `canceled`. After a failure, `get_run` shows
   exactly what ran and what did not.
-- **`resume_run`** re-arms a finished run: failed + skipped tasks are reset to
-  `pending` (previous error kept in `last_error`) and it re-reads the plan
-  snapshot. Use it after `update_run_plan`.
+- **`resume_run`** re-arms a finished run: failed + canceled + skipped tasks are
+  reset to `pending` (previous error kept in `last_error`) and it re-reads the
+  plan snapshot. Use it after `update_run_plan` — and after canceling a task to
+  recover a run stopped by that cancellation.
 - **Live edits** (`update_run_plan`) apply **between tasks**; a running task is
   never interrupted. New tasks are scheduled; removed pending tasks are canceled.
 - **`cancel_task`** stops one task and the run continues; **`cancel_run`** stops

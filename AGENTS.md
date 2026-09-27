@@ -20,7 +20,8 @@ plan.yaml ──▶ server (orchestrator) ──HTTP──▶ worker(s) ──CL
   config, runs `opencode run`, then publishes (commit/push) and records
   artifacts.
 - A **run** is fail-fast: the first failed task stops new dispatches, in-flight
-  tasks finish, the rest are `skipped`. `resume_run` re-arms failed+skipped.
+  tasks finish, the rest are `skipped`. `resume_run` re-arms failed, canceled
+  and skipped tasks.
 
 ## 2. Where everything lives
 

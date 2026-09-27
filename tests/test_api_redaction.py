@@ -54,6 +54,19 @@ def _setup(tmp_path):
                 "worker_url": "http://10.0.0.174:8787",
                 "job_id": "a-1234",
                 "depends_on": [],
+                "resources": [
+                    {
+                        "type": "git",
+                        "id": "repo",
+                        "with": {
+                            "repo": "https://example.test/app",
+                            "path": "D:\\data\\repo",
+                            "branch": "hiveling/{run}/feature",
+                            "ref": "main",
+                            "publish": "push",
+                        },
+                    }
+                ],
             }
         ],
     )
@@ -140,6 +153,10 @@ def test_run_and_task_endpoints_hide_paths(tmp_path):
     assert "worker_url" not in task["task"]
     assert "path" not in task["request"]["resources"][0]["with"]
     assert "agents_paths" not in task["request"]["opencode"]
+    # Resolved git resources are exposed so branches are visible in the UI; the
+    # local path is still stripped.
+    assert task["resources"][0]["with"]["branch"] == "hiveling/run-1/feature"
+    assert "path" not in task["resources"][0]["with"]
 
     assert "path" not in plan
     assert "source_path" not in plan
@@ -176,6 +193,8 @@ def test_mcp_tools_hide_paths(tmp_path):
 
     assert "path" not in task["request"]["resources"][0]["with"]
     assert "agents_paths" not in task["request"]["opencode"]
+    assert task["resources"][0]["with"]["branch"] == "hiveling/run-1/feature"
+    assert "path" not in task["resources"][0]["with"]
 
 
 def test_redactor_scrubs_server_roots_in_text(tmp_path):

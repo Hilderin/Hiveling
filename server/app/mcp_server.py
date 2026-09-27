@@ -20,7 +20,7 @@ from typing import Any
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ResourceNotFoundError, ToolError
 
-from .plan import PlanError
+from .plan import PlanError, load_plan, substitute_resources
 from .plan_files import (
     is_editable_plan,
     list_plan_files,
@@ -54,8 +54,8 @@ Typical flow:
 4. A run stops at the first failed task (fail fast): no new task is started,
    but tasks already running finish before the run is reported terminal; the
    remaining tasks are marked skipped. Analyse the failure, adjust with
-   update_run_plan if needed, then resume_run to re-run the failed and skipped
-   tasks and continue the run.
+   update_run_plan if needed, then resume_run to re-run the failed, canceled
+   and skipped tasks and continue the run.
 5. cancel_run stops a whole run, cancel_task cancels a single task (running
    tasks are stopped, pending tasks never run, and the run continues).
 6. get_plan / update_plan inspect or edit a stored plan. To edit the plan of a
@@ -91,6 +91,26 @@ def create_mcp_server(manager, config) -> MCPServer:
                     return config.history_dir / task["history_rel"]
                 break
         return None
+
+    def task_display_resources(
+        run: dict, run_id: str, task_id: str, state: dict, request: dict
+    ) -> list[dict]:
+        """The task's resources with ``{run}``/``{task}`` resolved, for display."""
+        raw = state.get("resources") if isinstance(state, dict) else None
+        if raw:
+            return substitute_resources(raw, run_id, task_id)
+        if request.get("resources"):
+            return [dict(resource) for resource in request["resources"]]
+        plan_file = manager.run_plan_file(run_id)
+        if plan_file is not None:
+            try:
+                plan = load_plan(plan_file, base_dir=run.get("base_dir"))
+                return substitute_resources(
+                    plan.task_by_id(task_id).resources, run_id, task_id
+                )
+            except PlanError:
+                pass
+        return []
 
     def start_run(
         plan_path: Path,
@@ -299,12 +319,15 @@ def create_mcp_server(manager, config) -> MCPServer:
 
         ``q`` searches the plan name and run id; ``status`` filters on run
         status (``all``, ``running``, ``succeeded``, ``failed``, ``canceled``).
+        Each run includes ``duration_s``: the sum of its tasks' real execution
+        durations across the current attempt and every archived retry (never the
+        start-to-end wall clock).
         """
-        return redact(
-            manager.store.query(
-                q=q, status=status, limit=max(1, min(limit, 200)), offset=max(0, offset)
-            )
+        page = manager.store.query(
+            q=q, status=status, limit=max(1, min(limit, 200)), offset=max(0, offset)
         )
+        manager.attach_durations(page)
+        return redact(page)
 
     @mcp.tool()
     def get_run(run_id: str) -> dict[str, Any]:
@@ -323,8 +346,11 @@ def create_mcp_server(manager, config) -> MCPServer:
     def get_task(run_id: str, task_id: str, events_tail_lines: int = 50) -> dict[str, Any]:
         """Return one task's detail: status, result, error and changed files.
 
+        ``resources`` lists the task's resources with ``{run}``/``{task}``
+        resolved (so git branches are visible even before the task runs).
         ``events_tail_lines`` limits the OpenCode event log returned (0 for
-        none); the full log stays available in the dashboard.
+        none); the full log stays available in the dashboard, which streams it
+        live for a running task.
         """
         run = manager.store.read(run_id)
         if run is None:
@@ -341,6 +367,7 @@ def create_mcp_server(manager, config) -> MCPServer:
             "events": "",
             "event_lines": 0,
             "stderr": "",
+            "resources": [],
             "commits": list(state.get("commits") or []),
             "artifacts": list(state.get("artifacts") or []),
             "merge": dict(state.get("merge") or {}),
@@ -365,6 +392,9 @@ def create_mcp_server(manager, config) -> MCPServer:
             detail["event_lines"] = total
             stderr, _ = read_text(directory / "stderr.log", tail)
             detail["stderr"] = stderr
+        detail["resources"] = task_display_resources(
+            run, run_id, task_id, state, detail["request"]
+        )
         return redact(detail)
 
     @mcp.tool()
@@ -414,12 +444,13 @@ def create_mcp_server(manager, config) -> MCPServer:
 
     @mcp.tool()
     def resume_run(run_id: str) -> dict[str, Any]:
-        """Continue a finished run by re-running its failed and skipped tasks.
+        """Continue a finished run by re-running its failed, canceled and skipped tasks.
 
         The run keeps its succeeded tasks and re-reads its plan snapshot (so
-        live edits apply), then continues from where it stopped. Use it to
-        retry after an orchestrator has adjusted the plan. The previous error is
-        preserved in each task's ``last_error``.
+        live edits apply), then continues from where it stopped. This also
+        recovers a run stopped by canceling a task (or the whole run), so it can
+        be resumed without editing the plan. The previous error is preserved in
+        each task's ``last_error``.
         """
         result = manager.resume_run(run_id)
         if not result.get("ok"):
@@ -433,7 +464,9 @@ def create_mcp_server(manager, config) -> MCPServer:
 
         Workers come from ``workers.yaml`` (not from plans). The file is reloaded
         automatically when it changes, so an added worker shows up without a
-        server restart.
+        server restart. Each worker's ``resources`` reports live machine capacity
+        (CPU count/speed, total/available RAM), while ``capabilities`` reports
+        what it can run (os, arch, tags, labels, providers).
         """
         data = probe_workers(manager.workers)
         return redact(data)

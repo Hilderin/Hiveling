@@ -57,9 +57,10 @@ def _status_paths(directory: Path) -> list[Path]:
 def _usage_for_task(directory: Path | None) -> dict:
     tokens = _new_tokens()
     cost = 0.0
+    duration = 0.0
     attempts = 0
     if directory is None:
-        return {"tokens": tokens, "cost": cost, "attempts": attempts}
+        return {"tokens": tokens, "cost": cost, "duration_s": duration, "attempts": attempts}
     for path in _status_paths(directory):
         status = read_json(path)
         if not isinstance(status, dict) or not status:
@@ -68,20 +69,26 @@ def _usage_for_task(directory: Path | None) -> dict:
         raw_cost = status.get("cost")
         if raw_cost is not None:
             cost += float(raw_cost)
+        raw_duration = status.get("duration_s")
+        if raw_duration is not None:
+            duration += float(raw_duration)
         attempts += 1
     tokens["total"] = _sum_tokens(tokens)
-    return {"tokens": tokens, "cost": cost, "attempts": attempts}
+    return {"tokens": tokens, "cost": cost, "duration_s": duration, "attempts": attempts}
 
 
 def run_usage(run: dict, history_dir: Path) -> dict:
-    """Return a run's cumulative tokens/cost, per task and overall.
+    """Return a run's cumulative tokens/cost/duration, per task and overall.
 
     ``run`` is the raw run document (its tasks still carry ``history_rel``), so
-    call this before redaction strips those paths.
+    call this before redaction strips those paths. ``duration_s`` sums the real
+    per-attempt ``duration_s`` reported by the worker (current attempt plus every
+    archived ``attempt-<n>/``), never the run's start-to-end wall clock.
     """
     tasks: dict[str, dict] = {}
     total_tokens = _new_tokens()
     total_cost = 0.0
+    total_duration = 0.0
     total_attempts = 0
     for task in run.get("tasks", []):
         task_id = task.get("id")
@@ -93,11 +100,13 @@ def run_usage(run: dict, history_dir: Path) -> dict:
         tasks[task_id] = usage
         _add_tokens(total_tokens, usage["tokens"])
         total_cost += usage["cost"]
+        total_duration += usage["duration_s"]
         total_attempts += usage["attempts"]
     total_tokens["total"] = _sum_tokens(total_tokens)
     return {
         "tokens": total_tokens,
         "cost": total_cost,
+        "duration_s": total_duration,
         "attempts": total_attempts,
         "tasks": tasks,
     }

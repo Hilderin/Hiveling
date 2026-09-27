@@ -47,3 +47,17 @@ def test_invalid_yaml_surfaces_error(tmp_path):
     # The worker keeps serving with detected capabilities and reports the error.
     assert "error" in result
     assert "ephemeral" in result["providers"]
+
+
+def test_detect_resources_reports_cpu_and_memory():
+    from worker.app.capabilities import detect_resources
+
+    resources = detect_resources()
+    # CPU count is always available from the stdlib; total RAM and speed are
+    # best-effort but must never raise (None is an accepted answer).
+    assert resources["cpu_count"] is None or resources["cpu_count"] >= 1
+    assert resources["ram_total_bytes"] is None or resources["ram_total_bytes"] > 0
+    assert resources["cpu_speed_mhz"] is None or resources["cpu_speed_mhz"] > 0
+    assert "ram_available_bytes" in resources
+    assert "cpu_count_physical" in resources
+

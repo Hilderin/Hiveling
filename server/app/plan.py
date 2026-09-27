@@ -131,6 +131,28 @@ def _merge_resources(default_defaults: list | None, task_resources: list | None)
     return [merged[resource_id] for resource_id in order]
 
 
+def substitute_resources(resources: list[dict], run_id: str, task_id: str) -> list[dict]:
+    """Resolve ``{run}`` / ``{task}`` in resource option strings.
+
+    Only task-local substitutions exist; cross-task references are not
+    supported (a consumer writes the producer's branch name and lists the
+    dependency in ``depends_on``). This is the same substitution the scheduler
+    applies before dispatching a task, exposed so the UI/MCP can display the
+    resolved resources of a task that has not run yet.
+    """
+
+    def substitute(value):
+        if isinstance(value, str):
+            return value.replace("{run}", run_id).replace("{task}", task_id)
+        if isinstance(value, list):
+            return [substitute(item) for item in value]
+        if isinstance(value, dict):
+            return {key: substitute(item) for key, item in value.items()}
+        return value
+
+    return [substitute(resource) for resource in (resources or [])]
+
+
 def _merge_opencode(defaults: dict, override: dict | None) -> dict:
     """Merge defaults + task OpenCode blocks: dicts merge, lists concatenate."""
     base = defaults.get("opencode")

@@ -141,7 +141,8 @@ Useful flags:
 The layout:
 
 - left sidebar: **Workers** (reachable/busy state of every worker from
-  `workers.yaml`; workers added while the server runs appear without a restart)
+  `workers.yaml`, plus its live CPU count/speed and free/total RAM; workers
+  added while the server runs appear without a restart)
   and **Active runs** (compact list of runs still
   running, with `done/total` tasks);
 - **home** (right pane, also reached by clicking **Hiveling** in the header):
@@ -150,11 +151,16 @@ The layout:
 - **History** link: full list of runs, newest first, with a search box (plan
   name or run id) and pagination;
 - run view: task tree with each task's state (`pending`/`running`/`succeeded`/
-  `failed`/`skipped`/`canceled`) and the run's **cumulative tokens and cost**
-  across every attempt (resume, gate re-arm, re-dispatch), plus the number of
-  attempts;
+  `failed`/`skipped`/`canceled`), the run's **total execution duration** (the sum
+  of every task's real duration across all retries, not start-to-end wall clock)
+  and its **cumulative tokens and cost** across every attempt (resume, gate
+  re-arm, re-dispatch), plus the number of attempts;
 - task detail: worker, job id, model, duration, tokens, cost, session, error,
-  changed files (download as zip), result, tool calls, prompt, events, stderr;
+  **resources** (including the resolved git branches), changed files (download
+  as zip), result, tool calls, prompt, **live events** streamed step by step and
+  formatted as console-style lines while the task runs, plus the saved events and
+  stderr;
+- runs list and history show each run's total duration next to its status;
 - actions: cancel a running run (with confirmation), resume a finished run,
   cancel a single task, retry a task, and view/edit the run's plan **while it
   runs** (the change is applied between tasks to the pending ones; running and
@@ -185,11 +191,13 @@ API:
 - `GET /api/runs?status=active|all&q=<search>&limit=&offset=` — paginated runs.
 - `GET /api/plans` — stored plans (name, task count, editable) for the home page.
 - `GET /api/runs/{id}` — run state including its cumulative `usage`
-  (`tokens`/`cost`/`attempts`, per task and overall).
+  (`tokens`/`cost`/`duration_s`/`attempts`, per task and overall).
 - `POST /api/runs/{id}/cancel`, `POST /api/runs/{id}/resume`,
   `GET /api/runs/{id}/wait?timeout_s=&until=` (long-poll run state),
   `POST /api/runs/{id}/tasks/{task}/cancel`,
   `GET /api/runs/{id}/tasks/{task}`,
+  `GET /api/runs/{id}/tasks/{task}/events` (live Server-Sent Events of the
+  task's event log while it runs, or the saved log once it is done),
   `GET /api/runs/{id}/tasks/{task}/files`,
   `GET|PUT /api/runs/{id}/plan`, `GET /api/workers`.
 
@@ -213,13 +221,13 @@ OpenCode ──MCP/HTTP──▶ http://127.0.0.1:8080/mcp ──▶ RunManager 
 | `create_plan` | create a plan from a **structured** plan object (typed input schema) |
 | `run_plan` | start a run from a plan name or inline YAML; returns `run_id` immediately |
 | `wait_for_run` | block until a run finishes (`terminal`, waiting for any task still in flight) or changes; returns the state and the wake reason |
-| `list_runs` | paginated runs with search and status filter |
-| `get_run` | run status plus every task state (poll this) |
-| `get_task` | one task's status, result, error and changed files |
+| `list_runs` | paginated runs with search and status filter, each with its real total duration |
+| `get_run` | run status plus every task state (poll this); includes cumulative duration/tokens/cost |
+| `get_task` | one task's status, result, resources (resolved branches), error and changed files |
 | `cancel_run` | cancel a whole run (running task + all pending tasks) |
 | `cancel_task` | cancel one task: stop it if running, or skip it if pending; the run continues |
-| `resume_run` | re-run the failed/skipped tasks of a finished run and continue it |
-| `list_workers` | reachable/busy state of the workers from `workers.yaml` |
+| `resume_run` | re-run the failed, canceled and skipped tasks of a finished run and continue it |
+| `list_workers` | reachable/busy state and live resources (CPU/RAM) of the workers from `workers.yaml` |
 
 `update_run_plan` edits a run's plan live (see
 [Persistence, recovery and live edits](#persistence-recovery-and-live-edits));
@@ -233,8 +241,8 @@ every task that had not run yet is marked `skipped` with
 they run to completion before the run is finalized, so `wait_for_run` never
 returns while work is still in flight. This gives an orchestrator a clean,
 explicit decision point instead of a half-finished plan. `resume_run` re-arms a
-finished run: its `failed` and `skipped` tasks (still in the plan) are reset to
-`pending` — the previous error is kept in `last_error` and
+finished run: its `failed`, `canceled` and `skipped` tasks (still in the plan)
+are reset to `pending` — the previous error is kept in `last_error` and
 `status.json`/`result.txt` are archived under
 `history/<task>/<run>/attempt-N/` — and the run continues from where it stopped.
 
@@ -411,11 +419,16 @@ tasks:
 ### Requirements (capabilities)
 
 A worker advertises capabilities through `GET /health`: `os`, `arch`, `tools`,
-`providers`, `tags`, `labels` and (optionally) `path_roots`. A task's
-`requirements` are matched as a subset, so it only runs on a worker that can
-satisfy them; without requirements it runs on any free worker. If no reachable
-worker matches, the task **fails fast** instead of waiting for a worker.
-`list_workers` shows every worker's capabilities.
+`providers`, `tags`, `labels` and (optionally) `path_roots`, plus a live
+`resources` object with `cpu_count`, `cpu_count_physical`, `cpu_speed_mhz`,
+`cpu_model`, `ram_total_bytes`, `ram_available_bytes` and `load_average` (POSIX).
+A task's `requirements` are matched as a subset, so it only runs on a worker that
+can satisfy them; without requirements it runs on any free worker. If no
+reachable worker matches, the task **fails fast** instead of waiting for a
+worker. Within a run, the scheduler **prefers a worker that already ran a task of
+the run** when it is free, so its durable clone/worktree is reused instead of
+cloning the repository again on another worker. `list_workers` shows every
+worker's capabilities and resources.
 
 ```yaml
 requirements:
@@ -604,7 +617,7 @@ hot-reloaded configuration files and adverts them through `/health`:
 
 | File | Flag / env | Role |
 | --- | --- | --- |
-| `capabilities.yaml` | `--capabilities-file` / `WORKER_CAPABILITIES` | Advertised capabilities (`tags`, `labels`, `providers`, `path_roots`) merged with auto-detection. |
+| `capabilities.yaml` | `--capabilities-file` / `WORKER_CAPABILITIES` | Advertised capabilities (`tags`, `labels`, `providers`, `path_roots`) merged with auto-detection (`os`, `arch`, `tools`, and live `resources`: CPU/RAM). |
 | `secrets.yaml` | `--secrets-file` / `WORKER_SECRETS` | Flat `NAME: value` store; a plan only ever references secret **names** (the worker environment is the fallback). |
 | `opencode/` | `--opencode-dir` / `WORKER_OPENCODE_DIR` | Baseline OpenCode bundle (`opencode.json`, `agents/`, `skills/`, `AGENTS.md`) applied to every job. |
 
@@ -725,7 +738,7 @@ handles.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/health` | worker state: `busy`, `active_job`, `opencode_bin` |
+| `GET` | `/health` | worker state: `busy`, `active_job`, `opencode_bin`, `capabilities`, live `resources` (CPU/RAM) |
 | `POST` | `/jobs` | create a job (`accepted`), returns status |
 | `PUT` | `/jobs/{id}/files` | upload a zip of input files (raw body) |
 | `POST` | `/jobs/{id}/start` | start execution |
@@ -804,7 +817,8 @@ Flags: `--log-dir` (default `./.data/logs`, env `WORKER_LOG_DIR`), `--log-level`
   network); the MCP endpoint can require a bearer token (see above).
 - Runs can be stopped as a whole (`cancel_run`) and individual tasks can be
   canceled (`cancel_task`); a canceled task makes the run finish as `failed` if
-  no other outcome overrides it.
+  no other outcome overrides it, and `resume_run` re-arms it (along with failed
+  and skipped tasks) so the run can continue.
 - After a failure, in-flight tasks run to completion (they are never killed);
   only tasks that had not started yet are marked `skipped`. Recovery still
   requires the worker to hold the job: if the worker restarted too, the

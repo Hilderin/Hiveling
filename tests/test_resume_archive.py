@@ -110,5 +110,34 @@ def test_resume_without_work_is_refused(tmp_path):
     )
     assert manager.resume_run("run-1") == {
         "ok": False,
-        "reason": "no failed or skipped task to resume",
+        "reason": "no failed, canceled or skipped task to resume",
     }
+
+
+def test_resume_rearms_a_canceled_task(tmp_path):
+    """A run stopped by canceling a task can be resumed without editing the plan."""
+    manager, plan_file = _manager(tmp_path)
+    manager.store.create(
+        "run-1",
+        plan_path=str(plan_file),
+        plan_name="p.yaml",
+        only=None,
+        plan_snapshot=str(plan_file),
+        tasks=[
+            {"id": "done", "kind": "task", "status": "succeeded", "attempts": 1, "depends_on": []},
+            {"id": "a", "kind": "task", "status": "canceled", "attempts": 0,
+             "error": "canceled by user", "depends_on": []},
+        ],
+    )
+    manager._resume = lambda run: None
+
+    result = manager.resume_run("run-1")
+
+    assert result["ok"] is True
+    assert result["reset"] == ["a"]
+    tasks = {t["id"]: t for t in manager.store.read("run-1")["tasks"]}
+    assert tasks["a"]["status"] == "pending"
+    assert tasks["a"]["error"] is None
+    assert tasks["a"]["last_error"] == "canceled by user"
+    # The succeeded task is left untouched.
+    assert tasks["done"]["status"] == "succeeded"

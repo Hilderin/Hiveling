@@ -116,6 +116,7 @@ def probe_workers(registry: WorkerRegistry, timeout: float = 2.0) -> dict:
             "active_job": None,
             "opencode_bin": None,
             "capabilities": {},
+            "resources": {},
         }
         client = WorkerClient(worker, timeout=timeout)
         try:
@@ -126,6 +127,7 @@ def probe_workers(registry: WorkerRegistry, timeout: float = 2.0) -> dict:
                 active_job=health.get("active_job"),
                 opencode_bin=health.get("opencode_bin"),
                 capabilities=health.get("capabilities") or {},
+                resources=health.get("resources") or {},
             )
         except WorkerError:
             pass

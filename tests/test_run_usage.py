@@ -20,10 +20,13 @@ TOKENS_NEW = {"input": 2000, "output": 400, "reasoning": 100,
               "cache": {"read": 8000, "write": 0}}
 
 
-def _write_status(directory, tokens, cost):
+def _write_status(directory, tokens, cost, duration=None):
     directory.mkdir(parents=True, exist_ok=True)
+    payload = {"status": "succeeded", "tokens": tokens, "cost": cost}
+    if duration is not None:
+        payload["duration_s"] = duration
     (directory / "status.json").write_text(
-        json.dumps({"status": "succeeded", "tokens": tokens, "cost": cost}),
+        json.dumps(payload),
         encoding="utf-8",
     )
 
@@ -31,9 +34,9 @@ def _write_status(directory, tokens, cost):
 def test_run_usage_sums_current_and_archived_attempts(tmp_path):
     history = tmp_path / "history"
     task_dir = history / "a" / "run-1"
-    _write_status(task_dir, TOKENS_NEW, 0.02)
-    _write_status(task_dir / "attempt-1", TOKENS_OLD, 0.01)
-    _write_status(task_dir / "attempt-2", TOKENS_OLD, 0.01)
+    _write_status(task_dir, TOKENS_NEW, 0.02, duration=12.5)
+    _write_status(task_dir / "attempt-1", TOKENS_OLD, 0.01, duration=30.0)
+    _write_status(task_dir / "attempt-2", TOKENS_OLD, 0.01, duration=7.5)
 
     run = {"tasks": [{"id": "a", "history_rel": "a/run-1"}]}
     usage = run_usage(run, history)
@@ -44,7 +47,10 @@ def test_run_usage_sums_current_and_archived_attempts(tmp_path):
     assert usage["tokens"]["cache"]["read"] == 18000
     assert usage["tokens"]["total"] == 4000 + 800 + 200 + 18000
     assert round(usage["cost"], 5) == 0.04
+    # The real per-attempt durations are summed (current + archived retries).
+    assert usage["duration_s"] == 12.5 + 30.0 + 7.5
     assert usage["tasks"]["a"]["attempts"] == 3
+    assert usage["tasks"]["a"]["duration_s"] == 50.0
 
 
 def test_run_endpoint_exposes_usage(tmp_path):
@@ -67,14 +73,18 @@ def test_run_endpoint_exposes_usage(tmp_path):
                 "attempts": 2, "history_rel": "a/run-1"}],
     )
     task_dir = tmp_path / "history" / "a" / "run-1"
-    _write_status(task_dir, TOKENS_NEW, 0.02)
-    _write_status(task_dir / "attempt-1", TOKENS_OLD, 0.01)
+    _write_status(task_dir, TOKENS_NEW, 0.02, duration=10.0)
+    _write_status(task_dir / "attempt-1", TOKENS_OLD, 0.01, duration=5.0)
 
     with TestClient(create_app(config, manager)) as client:
         run = client.get("/api/runs/run-1").json()
+        listed = client.get("/api/runs").json()["runs"][0]
 
     assert run["usage"]["attempts"] == 2
     assert run["usage"]["tokens"]["total"] == 2000 + 400 + 100 + 8000 + 1000 + 200 + 50 + 5000
     assert round(run["usage"]["cost"], 5) == 0.03
+    assert run["usage"]["duration_s"] == 15.0
+    # The runs list carries the same summed duration.
+    assert listed["duration_s"] == 15.0
     # History paths are still stripped from the response.
     assert "history_rel" not in run["tasks"][0]

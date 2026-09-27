@@ -26,7 +26,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
-from .capabilities import Capabilities
+from .capabilities import Capabilities, detect_resources
 from .config import Config
 from .gc import prune as prune_jobs
 from .executor import execute, _terminate
@@ -185,6 +185,7 @@ def create_app(config: Config) -> FastAPI:
             "opencode_bin": binary,
             "jobs": len(registry.all()),
             "capabilities": capabilities.get(),
+            "resources": detect_resources(),
         }
 
     @app.get("/jobs")

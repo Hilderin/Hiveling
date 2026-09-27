@@ -254,6 +254,97 @@ function esc(s) {
 }
 function fmtDur(s) { return s == null ? '' : (Math.round(s*10)/10) + 's'; }
 function fmtTime(ts) { return ts ? new Date(ts*1000).toLocaleString() : ''; }
+function fmtRam(free, total) {
+  if (total == null) return '';
+  const gb = 1024 * 1024 * 1024;
+  const freeText = free == null ? '?' : Math.round(free/gb*10)/10;
+  const totalText = total/gb >= 10 ? Math.round(total/gb) : Math.round(total/gb*10)/10;
+  return 'ram ' + freeText + ' / ' + totalText + ' GiB';
+}
+function workerResources(w) {
+  const r = w.resources || {};
+  const parts = [];
+  if (r.cpu_count != null) {
+    parts.push('cpu ' + r.cpu_count + (r.cpu_count_physical ? '/' + r.cpu_count_physical + 'c' : '') +
+      (r.cpu_speed_mhz ? ' @ ' + Math.round(r.cpu_speed_mhz) + ' MHz' : ''));
+  }
+  const ram = fmtRam(r.ram_available_bytes, r.ram_total_bytes);
+  if (ram) parts.push(ram);
+  return parts.join(' · ');
+}
+function runDuration(r) { return r.duration_s != null ? ' &middot; ' + fmtDur(r.duration_s) : ''; }
+function fmtResource(r) {
+  const lines = [`${r.type || '?'} '${r.id || '?'}'`];
+  const opts = r.with || {};
+  Object.keys(opts).forEach(k => {
+    const v = opts[k];
+    lines.push('  ' + k + ': ' + (Array.isArray(v) ? v.join(', ')
+      : (v && typeof v === 'object' ? JSON.stringify(v) : v)));
+  });
+  if (r.when && Object.keys(r.when).length) lines.push('  when: ' + JSON.stringify(r.when));
+  return lines.join('\n');
+}
+// Turn one OpenCode/hiveling JSON event into a readable console-log line.
+function fmtEvent(line) {
+  const raw = String(line == null ? '' : line);
+  if (!raw.trim()) return '';
+  let ev;
+  try { ev = JSON.parse(raw); } catch (e) { return raw; }
+  if (!ev || typeof ev !== 'object') return raw;
+  const part = ev.part || {};
+  const type = ev.type || part.type || 'event';
+  let ts = '';
+  if (ev.timestamp) {
+    const d = new Date(ev.timestamp);
+    if (!isNaN(d.getTime())) ts = d.toTimeString().slice(0, 8) + ' ';
+  }
+  const tag = name => ts + '[' + name + '] ';
+  switch (type) {
+    case 'step_start':
+    case 'step-start':
+      return tag('step') + 'start';
+    case 'step_finish':
+    case 'step-finish': {
+      const t = part.tokens || {};
+      const bits = [];
+      if (t.input != null) bits.push('in ' + t.input);
+      if (t.output != null) bits.push('out ' + t.output);
+      if (t.reasoning) bits.push('reasoning ' + t.reasoning);
+      if (part.cost != null) bits.push('$' + Number(part.cost).toFixed(4));
+      return tag('step') + 'finish' + (bits.length ? '  ' + bits.join(' / ') : '');
+    }
+    case 'text':
+      return tag('text') + String(part.text || '');
+    case 'tool_use':
+    case 'tool': {
+      const tool = part.tool || part.name || 'tool';
+      const state = part.state || {};
+      const title = (state.input && (state.input.command || state.input.filePath || state.input.path))
+        || state.title || '';
+      let out = tag('tool') + tool + (title ? ': ' + title : '');
+      const output = state.output || (state.metadata && state.metadata.output);
+      if (output) {
+        const first = String(output).split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
+        if (first && first !== title) out += ' \u2192 ' + first.slice(0, 160);
+      }
+      return out;
+    }
+    case 'error': {
+      const err = ev.error || {};
+      const data = err.data || {};
+      const message = data.message || err.message || err.name || err.type || raw;
+      return tag('error') + message;
+    }
+    case 'hiveling.merge':
+      return tag('merge') + (ev.phase || '') + (ev.ref ? ' ' + ev.ref : '')
+        + (ev.files && ev.files.length ? ' (' + ev.files.length + ' file(s))' : '');
+    default:
+      return tag(type) + raw.slice(0, 240);
+  }
+}
+function fmtEvents(text) {
+  return String(text || '').split('\n').map(fmtEvent).filter(l => l !== '').join('\n');
+}
 function tokenTotal(t) {
   if (!t) return 0;
   if (t.total != null) return t.total;
@@ -305,7 +396,10 @@ function renderWorkers() {
   ul.innerHTML = state.workers.map(w => {
     const cls = !w.reachable ? 'failed' : (w.busy ? 'canceled' : 'succeeded');
     const txt = !w.reachable ? 'unreachable' : (w.busy ? 'busy' : 'free');
-    return `<li><span class="dot ${cls}"></span><b>${esc(w.name)}</b> <span class="muted">${txt}</span></li>`;
+    const res = w.reachable ? workerResources(w) : '';
+    return `<li><span class="dot ${cls}"></span><b>${esc(w.name)}</b> <span class="muted">${txt}</span>` +
+      (res ? `<div class="muted" style="font-size:11px; margin-left:15px">${esc(res)}</div>` : '') +
+      `</li>`;
   }).join('') || '<li class="muted">none</li>';
 }
 
@@ -361,7 +455,7 @@ function renderHomeRuns() {
   document.getElementById('home-runs').innerHTML = runs.map(r => {
     return `<button class="runitem history" onclick="openRun('${r.run_id}')">
       <span class="dot ${r.status}"></span><b>${esc(r.plan_name)}</b>
-      <span class="muted">${esc(r.status)} &middot; ${fmtTime(r.created_at)} &middot; ${r.task_count} tasks</span>
+      <span class="muted">${esc(r.status)} &middot; ${fmtTime(r.created_at)} &middot; ${r.task_count} tasks${runDuration(r)}</span>
       <div class="muted" style="font-size:12px">${esc(r.run_id)} &middot; ${runSummary(r)}</div>
     </button>`;
   }).join('') || '<div class="muted">no runs yet</div>';
@@ -403,7 +497,7 @@ function renderHistory() {
   document.getElementById('history-list').innerHTML = h.runs.map(r => {
     return `<button class="runitem history" onclick="openRun('${r.run_id}')">
       <span class="dot ${r.status}"></span><b>${esc(r.plan_name)}</b>
-      <span class="muted">${esc(r.status)} &middot; ${fmtTime(r.created_at)} &middot; ${r.task_count} tasks</span>
+      <span class="muted">${esc(r.status)} &middot; ${fmtTime(r.created_at)} &middot; ${r.task_count} tasks${runDuration(r)}</span>
       <div class="muted" style="font-size:12px">${esc(r.run_id)} &middot; ${runSummary(r)}</div>
     </button>`;
   }).join('') || '<div class="muted">no runs</div>';
@@ -423,6 +517,7 @@ function historyPage(delta) {
 }
 
 async function openHistory() {
+  stopTaskStream();
   state.view = 'history';
   state.run = null; state.runDetail = null;
   state.task = null; state.taskDetail = null;
@@ -445,6 +540,7 @@ function showView() {
 }
 
 function openHome() {
+  stopTaskStream();
   state.view = 'home';
   state.run = null; state.runDetail = null;
   state.task = null; state.taskDetail = null;
@@ -458,6 +554,7 @@ function openHome() {
 function openRun(runId) { loadRun(runId); }
 
 function backToRun() {
+  stopTaskStream();
   state.view = 'run';
   state.task = null;
   state.taskDetail = null;
@@ -470,6 +567,7 @@ async function loadRun(runId, keepTask) {
   try { state.runDetail = await api('/api/runs/' + encodeURIComponent(runId)); }
   catch (e) { reportError(e.message); return; }
   if (!keepTask) {
+    stopTaskStream();
     state.task = null; state.taskDetail = null;
     state.view = 'run';
     document.getElementById('editor-panel').classList.add('hidden');
@@ -494,6 +592,7 @@ function renderRun() {
   const usage = d.usage || {};
   const attempts = usage.attempts || 0;
   document.getElementById('run-usage').innerHTML =
+    `duration ${fmtDur(usage.duration_s) || '-'} &middot; ` +
     `tokens ${tokenBreakdown(usage.tokens)} &middot; cost ${fmtCost(usage.cost)}` +
     ` &middot; attempts ${attempts}`;
   document.getElementById('cancel-btn').classList.toggle('hidden', d.status !== 'running');
@@ -591,6 +690,9 @@ function renderTaskBody() {
     rows.push(['verdict', t.gate_verdict || (t.status === 'succeeded' ? 'VALID' : '-')]);
   }
   let html = '<table>' + rows.map(([k,v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join('') + '</table>';
+  if (d.resources && d.resources.length) {
+    html += `<p><b>resources</b><pre>${esc(d.resources.map(fmtResource).join('\n\n'))}</pre></p>`;
+  }
   if (isGate && t.gate_feedback)
     html += `<p><b>last gate feedback</b><pre>${esc(t.gate_feedback)}</pre></p>`;
   if (d.request && d.request.prompt)
@@ -601,9 +703,44 @@ function renderTaskBody() {
   if (t.error) html += `<p><b>error</b><pre>${esc(t.error)}</pre></p>`;
   if (t.changed_files && t.changed_files.length)
     html += `<p><b>changed files</b><pre>${esc(t.changed_files.join('\n'))}</pre></p>`;
-  if (d.events) html += `<details><summary>events (${d.event_lines} lines)</summary><pre>${esc(d.events)}</pre></details>`;
+  const live = t.status === 'pending' || t.status === 'running';
+  if (live)
+    html += `<details open><summary>live events</summary><pre id="live-events"></pre></details>`;
+  if (d.events) html += `<details><summary>events (${d.event_lines} lines)</summary><pre>${esc(fmtEvents(d.events))}</pre></details>`;
   if (d.stderr) html += `<details><summary>stderr</summary><pre>${esc(d.stderr)}</pre></details>`;
   document.getElementById('task-body').innerHTML = html;
+  // The body is rebuilt on every open, so (re)bind the live event stream to the
+  // fresh <pre>; the periodic refresh never calls this, so the stream persists.
+  if (live) startTaskStream(state.run, t.id);
+  else stopTaskStream();
+}
+
+// ------------------------------------------------------- live event stream
+let taskStream = null;
+
+function stopTaskStream() {
+  if (taskStream) { taskStream.close(); taskStream = null; }
+}
+
+// Follow a task's events step by step: the server tails the running worker job
+// (or the saved log once the task is done) and pushes each complete line.
+function startTaskStream(runId, taskId) {
+  const pre = document.getElementById('live-events');
+  stopTaskStream();
+  if (!pre) return;
+  const es = new EventSource(
+    `/api/runs/${encodeURIComponent(runId)}/tasks/${encodeURIComponent(taskId)}/events`);
+  taskStream = es;
+  pre.textContent = '';
+  // A reconnect replays the log from the start; clearing avoids duplicates.
+  es.onopen = () => { pre.textContent = ''; };
+  es.onmessage = ev => {
+    const pinned = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 24;
+    const line = fmtEvent(ev.data);
+    if (line) pre.textContent += line + '\n';
+    if (pinned) pre.scrollTop = pre.scrollHeight;
+  };
+  es.addEventListener('end', () => stopTaskStream());
 }
 
 // ------------------------------------------------------------------ actions
@@ -659,7 +796,7 @@ async function resumeRun() {
   if (!state.run) return;
   const ok = await askConfirm({
     title: 'Resume this run?',
-    body: state.run + ' — failed and skipped tasks are re-armed.',
+    body: state.run + ' — failed, canceled and skipped tasks are re-armed.',
     confirmLabel: 'Resume run',
     dismissLabel: 'Keep'
   });

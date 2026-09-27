@@ -4,26 +4,28 @@
 
 - Add security and authentication to communication with workers
 - Remote execution as a specific Windows user
-- Expose worker resources in the server and MCP (available/total RAM, CPU
-  count, CPU speed, etc.)
-- Show a run's total execution duration in the runs list and in the run detail
-  (do not use the difference between start and end, add the real durations of
-  the tasks and retries)
-- Stream a task's events live in the web task detail as they arrive, so you can
-  follow what is happening step by step instead of only seeing the final result
-- Show a task's resources in the task detail (git branches are not visible in
-  the UI)
-- Expose the same in the MCP tools: a run's duration and a task's resources
-- Worker affinity within a run: prefer (when free) the worker that already ran a
-  previous task of the run, so its repo clone/worktree is reused instead of
-  cloning the repo again on every other worker
-- On `resume_run`, also re-arm `canceled` tasks (currently only `failed` and
-  `skipped` are restarted), so a run stopped by canceling a task can be resumed
-  without editing the plan
 - Versioned plan mutations
 
 ## Done
 
+- Worker resources (CPU count/speed/model, total/available RAM, load average)
+  detected by the worker and exposed through `GET /health`, `GET /api/workers`
+  and MCP `list_workers`; shown in the dashboard sidebar (`server/app/workers.py`,
+  `worker/app/capabilities.py`; also in MCP `get_task`)
+- A run's total execution duration appears in the runs list, run detail and MCP
+  `list_runs`/`get_run`: it sums every task's real worker-reported `duration_s`
+  across the current attempt and archived retries, never the run's start-to-end
+  wall clock (`server/app/usage.py`, `RunManager.attach_durations`)
+- The web task detail streams a running task's events live (Server-Sent Events
+  on `GET /api/runs/{id}/tasks/{task}/events`), tailing the worker job while it
+  runs and replaying the saved log once it is done
+- The task detail shows the task's resources with `{run}`/`{task}` resolved, so
+  git branches are visible before, during and after a run
+- Worker affinity within a run: the scheduler prefers a worker that already ran
+  a task of the run when it is free, so its durable clone/worktree is reused
+  instead of being cloned again on another worker (`Orchestrator._choose_worker`)
+- `resume_run` also re-arms `canceled` tasks (not only `failed`/`skipped`), so a
+  run stopped by canceling a task can be resumed without editing the plan
 - Dashboard: home page (start a run from a stored plan via `GET /api/plans`,
   recent runs) reached by clicking the title in the header bar
 - Dashboard: run detail shows cumulative tokens/cost across retries (and the

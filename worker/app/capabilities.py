@@ -13,8 +13,10 @@ without restarting the worker.
 from __future__ import annotations
 
 import logging
+import os
 import platform
 import shutil
+import subprocess
 import threading
 from pathlib import Path
 
@@ -76,6 +78,158 @@ def detect_arch() -> str:
 
 def detect_tools() -> list[str]:
     return sorted({tool for tool in DETECTED_TOOLS if shutil.which(tool)})
+
+
+def _proc_cpuinfo() -> list[dict[str, str]]:
+    """Parse ``/proc/cpuinfo`` into one dict per logical CPU (Linux only)."""
+    try:
+        text = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    blocks: list[dict[str, str]] = []
+    for block in text.split("\n\n"):
+        info: dict[str, str] = {}
+        for line in block.splitlines():
+            if ":" in line:
+                key, value = line.split(":", 1)
+                info[key.strip()] = value.strip()
+        if info:
+            blocks.append(info)
+    return blocks
+
+
+def _physical_cores(blocks: list[dict[str, str]]) -> int | None:
+    pairs = {
+        (block.get("physical id"), block.get("core id"))
+        for block in blocks
+        if block.get("core id") is not None
+    }
+    pairs.discard((None, None))
+    return len(pairs) or None
+
+
+def _cpu_speed_mhz(blocks: list[dict[str, str]]) -> float | None:
+    """A representative CPU clock in MHz, best effort, cross-platform."""
+    speeds: list[float] = []
+    for block in blocks:
+        raw = block.get("cpu MHz")
+        if not raw:
+            continue
+        try:
+            speeds.append(float(raw))
+        except ValueError:
+            pass
+    if speeds:
+        # The per-core MHz reflect the current clock; report the fastest core.
+        return round(max(speeds), 1)
+    if os.name == "nt":  # pragma: no cover - Windows
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+            ) as key:
+                value, _ = winreg.QueryValueEx(key, "~MHz")
+                return float(value)
+        except Exception:
+            return None
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "hw.cpufrequency"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip().isdigit():
+            return round(int(out.stdout.strip()) / 1_000_000, 1)
+    except Exception:
+        pass
+    return None
+
+
+def _memory_bytes() -> tuple[int | None, int | None]:
+    """Total and currently available physical RAM in bytes, best effort."""
+    if os.name == "nt":  # pragma: no cover - Windows
+        try:
+            import ctypes
+
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = _MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullTotalPhys), int(status.ullAvailPhys)
+        except Exception:
+            pass
+        return None, None
+
+    total: int | None = None
+    available: int | None = None
+    meminfo = Path("/proc/meminfo")
+    if meminfo.is_file():
+        try:
+            values: dict[str, str] = {}
+            for line in meminfo.read_text(encoding="utf-8", errors="replace").splitlines():
+                key, _, raw = line.partition(":")
+                values[key.strip()] = raw.strip()
+            for name, target in (("MemTotal", "total"), ("MemAvailable", "available")):
+                token = values.get(name, "").split()
+                if token and token[0].isdigit():
+                    if target == "total":
+                        total = int(token[0]) * 1024
+                    else:
+                        available = int(token[0]) * 1024
+        except OSError:
+            pass
+    if total is None:
+        try:
+            page = os.sysconf("SC_PAGE_SIZE")
+            total = page * os.sysconf("SC_PHYS_PAGES")
+            try:
+                available = page * os.sysconf("SC_AVPHYS_PAGES")
+            except (ValueError, OSError):
+                pass
+        except (ValueError, OSError, AttributeError):
+            pass
+    return total, available
+
+
+def detect_resources() -> dict:
+    """Live machine resources advertised through ``GET /health``.
+
+    Unlike :class:`Capabilities` this is intentionally *not* cached: available
+    RAM changes while the worker runs, so the server sees the current value on
+    every probe. CPU count/speed and total RAM are stable; a failure to detect
+    any of them yields ``None`` instead of breaking the health check.
+    """
+    blocks = _proc_cpuinfo()
+    total, available = _memory_bytes()
+    try:
+        load_average: list[float] | None = [round(x, 2) for x in os.getloadavg()]
+    except (OSError, AttributeError):
+        load_average = None
+    model = next((b.get("model name") for b in blocks if b.get("model name")), None)
+    return {
+        "cpu_count": os.cpu_count(),
+        "cpu_count_physical": _physical_cores(blocks),
+        "cpu_speed_mhz": _cpu_speed_mhz(blocks),
+        "cpu_model": model or (platform.processor() or None),
+        "ram_total_bytes": total,
+        "ram_available_bytes": available,
+        "load_average": load_average,
+    }
 
 
 class Capabilities:

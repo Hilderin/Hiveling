@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel
@@ -29,7 +29,7 @@ from .dashboard_html import DASHBOARD_HTML
 from .history import archive_attempt
 from .mcp_server import BearerAuthMiddleware, create_mcp_server
 from .orchestrator import Orchestrator
-from .plan import PlanError, load_plan
+from .plan import PlanError, WorkerEndpoint, load_plan, substitute_resources
 from .plan_files import (
     is_editable_plan,
     list_plan_files,
@@ -43,6 +43,7 @@ from .readers import read_json, read_text, zip_dir
 from .redact import make_redactor
 from .runs import TERMINAL_RUN_STATUSES, RunStore, new_run_id
 from .usage import run_usage
+from .worker_client import WorkerClient, WorkerError
 from .workers import WorkerRegistry, probe_workers
 
 logger = logging.getLogger("hiveling.server.web")
@@ -370,13 +371,14 @@ class RunManager:
 
     # --------------------------------------------------------------- resume
     def resume_run(self, run_id: str) -> dict:
-        """Re-arm a finished run: reset its failed and skipped tasks to pending.
+        """Re-arm a finished run: reset its failed, canceled and skipped tasks.
 
         The run keeps its succeeded tasks, re-reads its plan snapshot (so live
-        edits apply) and continues from where it stopped. The previous error is
-        preserved in ``last_error`` and the finished attempt's evidence
-        (``status.json``, ``result.txt``, ``events.jsonl``, …) is archived under
-        ``<task history>/attempt-<n>/``.
+        edits apply) and continues from where it stopped. A run stopped by
+        canceling a task (or the whole run) can therefore be resumed without
+        editing the plan. The previous error is preserved in ``last_error`` and
+        the finished attempt's evidence (``status.json``, ``result.txt``,
+        ``events.jsonl``, …) is archived under ``<task history>/attempt-<n>/``.
         """
         if self.is_active(run_id):
             return {"ok": False, "reason": "run is already running"}
@@ -397,7 +399,7 @@ class RunManager:
         for task in run.get("tasks", []):
             if task.get("id") not in plan_ids:
                 continue  # removed from the plan: nothing to re-run
-            if task.get("status") not in ("failed", "skipped"):
+            if task.get("status") not in ("failed", "skipped", "canceled"):
                 continue
             attempt = task.get("attempts") or 0
             if task.get("history_rel"):
@@ -415,7 +417,7 @@ class RunManager:
             reset.append(task["id"])
 
         if not reset:
-            return {"ok": False, "reason": "no failed or skipped task to resume"}
+            return {"ok": False, "reason": "no failed, canceled or skipped task to resume"}
 
         run["status"] = "running"
         run["error"] = None
@@ -490,6 +492,21 @@ class RunManager:
                 self._condition.wait(timeout=min(remaining, 1.0))
 
     # ----------------------------------------------------------- heartbeat
+    def attach_durations(self, page: dict) -> dict:
+        """Add each run summary's real total task duration.
+
+        The summary only carries the run document's own fields, so the total
+        duration must be read from the history: it is the sum of every task's
+        worker-reported ``duration_s`` across the current attempt and archived
+        ones, not the run's start-to-end wall clock.
+        """
+        for summary in page.get("runs", []):
+            run = self.store.read(summary.get("run_id"))
+            if run is None:
+                continue
+            summary["duration_s"] = run_usage(run, self.config.history_dir)["duration_s"]
+        return page
+
     def start_heartbeat(self) -> None:
         if self.config.heartbeat_s <= 0:
             logger.info("heartbeat: disabled")
@@ -618,11 +635,11 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
         limit: int = 50,
         offset: int = 0,
     ) -> dict:
-        return redact(
-            manager.store.query(
-                q=q, status=status, limit=max(1, min(limit, 200)), offset=offset
-            )
+        page = manager.store.query(
+            q=q, status=status, limit=max(1, min(limit, 200)), offset=offset
         )
+        manager.attach_durations(page)
+        return redact(page)
 
     @app.post("/api/runs", status_code=201)
     async def api_run_start(request: Request) -> dict:
@@ -759,6 +776,31 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
                 break
         return None
 
+    def task_display_resources(
+        run: dict, run_id: str, task_id: str, state: dict, request: dict
+    ) -> list[dict]:
+        """The task's resources with ``{run}``/``{task}`` resolved, for display.
+
+        The run state carries the plan's raw resources, so a task that has not
+        dispatched yet still shows its branches. The finished request is the
+        fallback for older runs that predate the state field.
+        """
+        raw = state.get("resources") if isinstance(state, dict) else None
+        if raw:
+            return substitute_resources(raw, run_id, task_id)
+        if request.get("resources"):
+            return [dict(resource) for resource in request["resources"]]
+        plan_file = manager.run_plan_file(run_id)
+        if plan_file is not None:
+            try:
+                plan = load_plan(plan_file, base_dir=run.get("base_dir"))
+                return substitute_resources(
+                    plan.task_by_id(task_id).resources, run_id, task_id
+                )
+            except PlanError:
+                pass
+        return []
+
     @app.get("/api/runs/{run_id}/tasks/{task_id}")
     def api_task_get(run_id: str, task_id: str) -> dict:
         run = manager.store.read(run_id)
@@ -769,7 +811,7 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
             raise HTTPException(status_code=404, detail="task not found")
         directory = task_history_dir(run, task_id)
         detail: dict = {"task": state, "status": {}, "request": {}, "result": "",
-                        "events": "", "event_lines": 0, "stderr": ""}
+                        "events": "", "event_lines": 0, "stderr": "", "resources": []}
         if directory and directory.is_dir():
             detail["status"] = read_json(directory / "status.json")
             detail["request"] = read_json(directory / "request.json")
@@ -790,7 +832,101 @@ def create_app(config: DashboardConfig, manager: RunManager) -> FastAPI:
                     detail["request"]["prompt"] = plan.task_by_id(task_id).prompt
                 except PlanError:
                     pass
+        detail["resources"] = task_display_resources(
+            run, run_id, task_id, state, detail["request"]
+        )
         return redact(detail)
+
+    def stream_task_events(run_id: str, task_id: str):
+        """Yield a task's events as Server-Sent Events until it is terminal.
+
+        While the task runs, events are read live from the worker's job log (the
+        server's history is only written once the job ends); once it finishes the
+        saved ``events.jsonl`` is authoritative. Only complete lines are sent, so
+        a partially written line is never shown twice.
+        """
+        client: WorkerClient | None = None
+        client_url: str | None = None
+        sent = 0
+        last_ping = time.time()
+        while True:
+            run = manager.store.read(run_id)
+            if run is None:
+                break
+            state = next(
+                (t for t in run.get("tasks", []) if t.get("id") == task_id), None
+            )
+            if state is None:
+                break
+            terminal = state.get("status") in TASK_TERMINAL_STATUSES
+            text: str | None = None
+            if (
+                state.get("status") == "running"
+                and state.get("worker_url")
+                and state.get("job_id")
+            ):
+                url = state["worker_url"]
+                if client is None or client_url != url:
+                    if client is not None:
+                        client.close()
+                    client = WorkerClient(
+                        WorkerEndpoint(name=state.get("worker") or "worker", url=url)
+                    )
+                    client_url = url
+                try:
+                    text = client.logs(state["job_id"]).get("stdout") or ""
+                except WorkerError:
+                    text = None
+            elif terminal:
+                directory = task_history_dir(run, task_id)
+                events_path = directory / "events.jsonl" if directory else None
+                if events_path is not None and events_path.is_file():
+                    text = events_path.read_text(encoding="utf-8", errors="replace")
+
+            emitted = False
+            if text is not None:
+                complete = text[: text.rfind("\n") + 1]
+                if len(complete) < sent:
+                    sent = 0  # log truncated (new attempt): restart the stream
+                if len(complete) > sent:
+                    for line in complete[sent:].splitlines():
+                        yield f"data: {redact.text(line)}\n\n"
+                    sent = len(complete)
+                    emitted = True
+            if terminal:
+                if text is not None and len(text) > sent:
+                    tail = text[sent:].rstrip()
+                    sent = len(text)
+                    if tail:
+                        yield f"data: {redact.text(tail)}\n\n"
+                break
+            now = time.time()
+            if not emitted and now - last_ping >= 15:
+                last_ping = now
+                yield ": ping\n\n"
+            time.sleep(1.0)
+        if client is not None:
+            client.close()
+        yield "event: end\ndata: done\n\n"
+
+    @app.get("/api/runs/{run_id}/tasks/{task_id}/events")
+    def api_task_events(run_id: str, task_id: str) -> StreamingResponse:
+        """Live Server-Sent Events stream of one task's ``events.jsonl``."""
+        run = manager.store.read(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        state = next((t for t in run.get("tasks", []) if t.get("id") == task_id), None)
+        if state is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        return StreamingResponse(
+            stream_task_events(run_id, task_id),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
 
     @app.get("/api/runs/{run_id}/tasks/{task_id}/files")
     def api_task_files(run_id: str, task_id: str) -> Response:

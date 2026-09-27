@@ -36,7 +36,7 @@ from .gate import (
     with_gate_feedback,
 )
 from .history import History, archive_attempt
-from .plan import Plan, PlanError, Task, WorkerEndpoint, load_plan
+from .plan import Plan, PlanError, Task, WorkerEndpoint, load_plan, substitute_resources
 from .runs import RunStore, build_task_states, new_run_id
 from .worker_client import WorkerBusy, WorkerClient, WorkerError
 
@@ -133,6 +133,10 @@ class Orchestrator:
         # incremented when a task is actually dispatched (never on a busy retry),
         # and read back when a finished attempt is archived before a re-run.
         self._attempts: dict[str, int] = {}
+        # Worker affinity: base_url -> last-use timestamp for this run. The
+        # scheduler prefers a worker already used by the run so its durable
+        # clone/worktree is reused instead of cloned again elsewhere.
+        self._run_workers: dict[str, float] = {}
         if self.run_store is not None and self.run_id:
             self._load_gate_state()
         self._plan_stamp = self._stamp(self.plan_path)
@@ -151,6 +155,9 @@ class Orchestrator:
             if feedback:
                 self._gate_feedback[state["id"]] = feedback
             self._attempts[state["id"]] = state.get("attempts") or 0
+            worker_url = state.get("worker_url")
+            if worker_url:
+                self._run_workers[worker_url] = 1.0
 
     def _next_attempt(self, task_id: str) -> int:
         """Reserve the next 1-based attempt number for a dispatch."""
@@ -588,6 +595,9 @@ class Orchestrator:
             # Reattaching to a job left running by a previous server process
             # bypasses worker selection: it belongs to a specific worker.
             if task.id in self.resume_jobs:
+                job = self.resume_jobs[task.id]
+                if job.get("worker_url"):
+                    self._run_workers[job["worker_url"]] = time.time()
                 self._start_task(task, None, running, done)
                 dispatched = True
                 continue
@@ -598,19 +608,7 @@ class Orchestrator:
             if available is None:
                 available = self._available_clients(running)
 
-            pick: WorkerClient | None = None
-            matching_exists = False
-            for offset in range(len(available)):
-                index = (self._rr + offset) % len(available)
-                client, capabilities, busy, reserved = available[index]
-                if not self._matches(task, capabilities):
-                    continue
-                matching_exists = True
-                if busy or reserved or client.base_url in claimed:
-                    continue
-                pick = client
-                self._rr = index + 1
-                break
+            pick, _index, matching_exists = self._choose_worker(task, available, claimed)
 
             if pick is None:
                 if not matching_exists:
@@ -636,10 +634,51 @@ class Orchestrator:
                 continue
 
             claimed.add(pick.base_url)
+            self._run_workers[pick.base_url] = time.time()
             self._start_task(task, pick, running, done)
             dispatched = True
 
         return dispatched, capacity_blocked, requirements_failed
+
+    def _choose_worker(
+        self,
+        task: Task,
+        available: list,
+        claimed: set[str],
+    ) -> tuple[WorkerClient | None, int | None, bool]:
+        """Pick the best idle worker for ``task``.
+
+        Returns ``(client, index, matching_exists)``. ``matching_exists`` is True
+        when at least one reachable worker satisfies the task's requirements,
+        even if it is busy/reserved (so the caller can wait instead of failing
+        fast). Among idle matching workers, one already used by this run is
+        preferred (worker affinity: its clone/worktree is reused); otherwise the
+        usual round-robin order is kept.
+        """
+        idle: list[tuple[int, WorkerClient]] = []
+        matching_exists = False
+        for offset in range(len(available)):
+            index = (self._rr + offset) % len(available)
+            client, capabilities, busy, reserved = available[index]
+            if not self._matches(task, capabilities):
+                continue
+            matching_exists = True
+            if busy or reserved or client.base_url in claimed:
+                continue
+            idle.append((index, client))
+
+        if not idle:
+            return None, None, matching_exists
+
+        affinity = [item for item in idle if item[1].base_url in self._run_workers]
+        if affinity:
+            index, client = max(
+                affinity, key=lambda item: self._run_workers[item[1].base_url]
+            )
+        else:
+            index, client = idle[0]
+        self._rr = index + 1
+        return client, index, matching_exists
 
     @staticmethod
     def _matches(task: Task, capabilities: dict) -> bool:
@@ -900,18 +939,7 @@ class Orchestrator:
         supported: a consumer writes the producer's branch name and lists the
         dependency in ``depends_on`` (see the design doc, section 7.5).
         """
-        run_id = self.run_id
-
-        def substitute(value):
-            if isinstance(value, str):
-                return value.replace("{run}", run_id).replace("{task}", task_id)
-            if isinstance(value, list):
-                return [substitute(item) for item in value]
-            if isinstance(value, dict):
-                return {key: substitute(item) for key, item in value.items()}
-            return value
-
-        return [substitute(resource) for resource in (resources or [])]
+        return substitute_resources(resources, self.run_id, task_id)
 
     def _execute_on(self, client: WorkerClient, task: Task) -> TaskResult:
         job_id = f"{task.id}-{uuid.uuid4().hex[:8]}"
