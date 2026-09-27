@@ -16,9 +16,14 @@
 - Show a run's total execution duration in the runs list and in the run detail
 - Dashboard auto-refresh is disruptive: it interrupts scrolling inside
   textboxes and collapses open sections such as events
+- Stream a task's events live in the web task detail as they arrive, so you can
+  follow what is happening step by step instead of only seeing the final result
 - Show a task's resources in the task detail (git branches are not visible in
   the UI)
 - Expose the same in the MCP tools: a run's duration and a task's resources
+- Worker affinity within a run: prefer (when free) the worker that already ran a
+  previous task of the run, so its repo clone/worktree is reused instead of
+  cloning the repo again on every other worker
 
 ## Done
 
