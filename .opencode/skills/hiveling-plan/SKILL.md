@@ -400,6 +400,27 @@ finding if omitted:
   the model and add a busy timeout / WAL for write contention.
 - **Input validation order.** Freeze the precedence between `400` (bad body) and
   `404` (unknown id), and the rounding/format rules shared by JSON and CSV.
+- **Process lifecycle (start *and* stop).** Any prompt that asks the agent to
+  **start** something (a server, a daemon, a background job) must say how to
+  **stop** it, and must forbid killing by name or command-line pattern. The task's
+  own prompt is part of the OpenCode command line on the worker, so a cleanup like
+  `pkill -f 'app.server --host 127.0.0.1 --port 8123'` also matches — and kills —
+  the agent's own OpenCode process (exit 130; the run reports a transport error,
+  *not* the real cause). It can also kill unrelated processes on the worker
+  (MCP servers, other tooling). Pin the stop to the **PID/handle you captured**,
+  never a pattern:
+
+  ```sh
+  python3 -m app.server --host 127.0.0.1 --port 8123 --db /tmp/verify.db & SRV=$!
+  ... run the checks ...
+  kill "$SRV"          # NOT: pkill -f 'app.server ...'
+  ```
+
+  On Windows capture the process (`$p = Start-Process python -PassThru -ArgumentList
+  ...`) and `Stop-Process -Id $p.Id` — never `taskkill /IM`, `Stop-Process -Name`
+  or a `Get-CimInstance … | Stop-Process` sweep. If the task must not leave
+  anything running, say so explicitly; "start briefly" is an unbounded instruction
+  that invites exactly this mistake.
 
 ## Pitfalls
 
@@ -422,6 +443,12 @@ finding if omitted:
   writes a report, so it must publish *and* have the `edit` carve-out for
   `docs/reviews/…`.
 - Using a path not under the worker's `path_roots` (see `list_workers`).
+- Asking a task to start a server (or any process) without pinning how to stop it,
+  or letting a stop-by-pattern slip in: `pkill -f`/`killall` (POSIX) and
+  `taskkill /IM`/`Stop-Process -Name` (Windows) can kill the agent's own OpenCode
+  process — the prompt is in its command line — and unrelated worker processes.
+  Stop by the PID/handle you captured (see *Decomposition lessons → Process
+  lifecycle*).
 - `command` (arbitrary shell) is refused unless the worker advertises it.
 - Long prompts are command-line arguments on the worker (Windows limits): keep
   prompts concise; use `prompt_file`.
@@ -451,5 +478,7 @@ finding if omitted:
    does not enforce anything); if a reviewer writes a report, it is listed in
    the gate's `tasks` too.
 10. No secret value in the plan; no invented path or worker.
-11. Run, then `wait_for_run(until="terminal")`; on failure `get_task` →
+11. A task that starts a process also states how it stops it — by PID/handle, not
+    a name/pattern.
+12. Run, then `wait_for_run(until="terminal")`; on failure `get_task` →
     `update_run_plan` → `resume_run`; `cancel_run` to abort.

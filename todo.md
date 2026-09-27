@@ -13,6 +13,12 @@
 - Agent, tokens and cost are not present in the history
 - Expose worker resources in the server and MCP (available/total RAM, CPU
   count, CPU speed, etc.)
+- Show a run's total execution duration in the runs list and in the run detail
+- Dashboard auto-refresh is disruptive: it interrupts scrolling inside
+  textboxes and collapses open sections such as events
+- Show a task's resources in the task detail (git branches are not visible in
+  the UI)
+- Expose the same in the MCP tools: a run's duration and a task's resources
 
 ## Done
 
