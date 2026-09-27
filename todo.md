@@ -2,10 +2,86 @@
 
 ## Open
 
-- Add security and authentication to communication with workers
+### Security & hardening
+
+- Worker↔server auth + encryption, mandatory even inside a DC: mTLS, or at
+  minimum a bearer token over HTTPS/TLS. Today `worker_client.py` (httpx) speaks
+  in the clear and `worker/app/main.py` verifies nothing on the way in.
+- Lock down the server API: the current token only covers `/mcp`
+  (`mcp_server.BearerAuthMiddleware`). Extend it to `/api/*` and the dashboard,
+  or front everything with an authenticating reverse proxy. Otherwise binding
+  `0.0.0.0` lets anyone launch jobs.
+- Network egress default-deny: segment the workers and allowlist only what they
+  need (model endpoint, remote git, package mirrors). This is the real
+  anti-exfiltration barrier and Hiveling cannot provide it in software.
+- OS isolation per worker: a dedicated least-privilege service account and,
+  ideally, a VM/microVM per worker; `path_roots` stays useful but is not a
+  sandbox.
+- Ephemeral credentials: short-lived git tokens injected by name (as `secret`
+  already is); never a long-lived PAT in the environment.
+
+### Audit, identity & validation
+
+- Tamper-proof audit + identity: this is where versioned plan mutations pay off
+  — without an actor and an append-only journal you cannot answer "which plan,
+  who, when" after a leak.
+- Versioned plan mutations: make plan mutations an immutable journal. Live
+  edit/resume is a great feature, but the more powerful it becomes the more you
+  need to answer "which version of the plan caused this task?", "who changed
+  what?" and "what changed between attempt 2 and 3?". Keep revision (1, 2, 3…),
+  timestamp, actor, reason and a snapshot/diff.
+- Strict plan validation: `load_plan()`/`_parse_task()` currently extract known
+  fields and silently ignore unknown ones, so a typo like `depend_on:` instead of
+  `depends_on:` slips through. In a system that can launch agents for an hour, an
+  invalid config must die immediately. Make strict validation the source of truth
+  for the YAML (as MCP `PlanInput` already is).
+- Structured gate verdicts: the contract is essentially a standalone `VALID`
+  line; otherwise the text becomes the feedback and the targets start over. Move
+  to something like `{verdict: "valid"|"revise", findings:[...], evidence:[...]}`
+  with strict server-side validation, so a key engine decision stops depending on
+  a textual convention from the model.
+
+### AD / Azure Entra ID SSO (human login)
+
+Goal: use the corporate directory for both the MCP endpoint and the
+dashboard/API, so "who did what" has a real, verified actor.
+
+- Identity provider choice: **Entra ID** (OIDC/JWKS native). Raw on-prem AD DS is
+  Kerberos/LDAP only — front it with Entra ID (Entra Connect / Entra Domain
+  Services) or ADFS; Keycloak over LDAP is the fallback. Decide explicitly and
+  document the group→role mapping either way.
+- MCP server (`/mcp`): no custom client work — the OpenCode V2 remote MCP client
+  already does OAuth (PKCE, token refresh, authorization-server discovery) and
+  exposes `client_id`, `client_secret`, `scope`, `redirect_uri`, `callback_port`,
+  `auth_server_metadata_url`. **Entra does not support dynamic client
+  registration**, so pre-register the client, set `client_id`, and use
+  `auth_server_metadata_url` = Entra's tenant OIDC metadata instead of relying on
+  protected-resource metadata. Keep `oauth: false` + a static `Authorization`
+  header (env-injected) as break-glass / automation.
+- Entra app registration: expose a custom scope (e.g. `api://<id>/mcp.access`)
+  and a human-login app (loopback `http://127.0.0.1:<port>/callback`;
+  `http://localhost` for a public client). Validate the access token
+  server-side against the tenant JWKS (cache keys; check `aud`/`iss`/`exp`).
+- Server API + dashboard: same identity via Authorization Code + PKCE, session
+  cookie, and CSRF protection on every mutating POST (cancel/resume/edit).
+  Extend the existing `BearerAuthMiddleware` to `/api/*` and the root, or front
+  the app with an authenticating reverse proxy (`oauth2-proxy` / nginx
+  `auth_request`).
+- RBAC: map Entra groups / claims to Hiveling roles (who may run, cancel,
+  resume, edit plans, read audit). Authentication ≠ authorization.
+- Feed the SSO subject (`sub`/`oid`) into the audit journal as the actor, so
+  versioned plan mutations record a verified identity.
+- Operational fallback: keep a local break-glass token (rotation documented) for
+  automation and for when the IdP is unavailable, and define the behavior when
+  the IdP is down.
+
+### Other
+
+- Scheduler
+- Times on run: wall 1h52m · execution 1h02m · attempts 30
+- MCPs management from plan
 - Remote execution as a specific Windows user
-- Versioned plan mutations
-- Encrypted communication between server and workers
+
 
 ## Done
 
