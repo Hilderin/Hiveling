@@ -719,10 +719,9 @@ function renderTaskBody() {
   if (d.request && d.request.prompt)
     overview += `<p><b>prompt</b><pre>${esc(d.request.prompt)}</pre></p>`;
 
-  // Result: what the task produced.
+  // Result: what the task produced. Tool calls are not repeated here: they are
+  // already visible, formatted, in the Events tab.
   let result = '';
-  if (s.tool_calls && s.tool_calls.length)
-    result += `<p><b>tool calls</b><pre>${esc(s.tool_calls.join('\n'))}</pre></p>`;
   if (d.result) result += `<p><b>result</b><pre>${esc(d.result)}</pre></p>`;
   if (t.error) result += `<p><b>error</b><pre>${esc(t.error)}</pre></p>`;
   if (t.changed_files && t.changed_files.length)

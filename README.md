@@ -157,8 +157,8 @@ The layout:
   re-arm, re-dispatch), plus the number of attempts;
 - task detail: **tabbed** (Overview / Events / Result / stderr). Overview has the
   identity, worker, job id, model, duration, tokens, cost, session, **resources**
-  (including the resolved git branches) and prompt; Result has the result, tool
-  calls, error and changed files (download as zip); Events streams the log
+  (including the resolved git branches) and prompt; Result has the result, error
+  and changed files (download as zip); Events streams the log
   **live** and formats it as console-style lines while the task runs, then shows
   the saved log once it is done;
 - runs list and history show each run's total duration next to its status;
